@@ -15,8 +15,20 @@ logger = logging.getLogger(__name__)
 _CYPHER_SAFE_PATTERN = re.compile(r"\b(MATCH|CALL|RETURN|WITH|UNWIND)\b", re.IGNORECASE)
 
 # Reject write operations to defend against LLM-generated destructive queries (ASI05).
+# Includes APOC write paths that bypass the bare-keyword check.
 _CYPHER_WRITE_PATTERN = re.compile(
-    r"\b(CREATE|DELETE|DETACH|SET|REMOVE|MERGE|DROP)\b", re.IGNORECASE
+    r"""\b(
+        CREATE | DELETE | DETACH | SET | REMOVE | MERGE | DROP
+      | LOAD\s+CSV
+      | CALL\s+apoc\.(?:
+            schema | create | merge | refactor | delete | remove | set | drop
+          | iterate | periodic\.iterate
+          | cypher\.runWrite | cypher\.doIt
+          | export | load | trigger
+        )
+      | CALL\s+dbms\.security\.
+    )\b""",
+    re.IGNORECASE | re.VERBOSE,
 )
 
 # Template keyword triggers — ordered by specificity

@@ -1,8 +1,13 @@
 # KB Arena
 
-Which retrieval architecture works best for your documentation?
+> **Should you use Graph RAG, Vector RAG, or Hybrid?**
+> KB Arena tells you — empirically, on your own docs.
 
-KB Arena benchmarks **8 retrieval strategies** -- naive vector, contextual vector, Q&A pairs, knowledge graph, hybrid, RAPTOR, PageIndex, and BM25 -- on **your** documentation. Bring your docs in any format, run the pipeline, get empirical results. Ships with an AWS Compute corpus (75 questions across 5 difficulty tiers) as a built-in example.
+Eight retrieval architectures. Your documentation. One winner.
+
+KB Arena is the only open-source benchmark that runs **architecturally distinct** retrieval strategies — naive vector, contextual vector, Q&A pairs, knowledge graph, hybrid (RRF-fused), RAPTOR, PageIndex, BM25, and **rerank-vector** (cross-encoder reranking) — head-to-head on your own corpus, with auto-generated questions across 5 difficulty tiers, IR metrics (Recall@k, MRR, NDCG@k), RAGAS metrics, ELO arena voting, a CI gate, and a strategy plugin system.
+
+Embeddings: pluggable across **OpenAI, Voyage-3, Cohere, Gemini, BGE (local), Ollama (local)** via `KB_ARENA_EMBEDDING_PROVIDER`. Rerankers: **BGE-v2-m3 (local), Cohere Rerank, Voyage Rerank** via `KB_ARENA_RERANKER_BACKEND`.
 
 ![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue) ![Pydantic v2](https://img.shields.io/badge/pydantic-v2-green) ![Tests](https://img.shields.io/badge/tests-558-brightgreen) ![License](https://img.shields.io/badge/license-MIT-blue) ![PyPI](https://img.shields.io/pypi/v/kb-arena) ![CI](https://github.com/xmpuspus/kb-arena/actions/workflows/ci.yml/badge.svg)
 
@@ -10,16 +15,29 @@ KB Arena benchmarks **8 retrieval strategies** -- naive vector, contextual vecto
 
 ---
 
-## Try It in 10 Seconds
-
-No API keys. No Docker. Just explore real benchmark results:
+## Try It in 10 Seconds (no API keys)
 
 ```bash
 pip install kb-arena
 kb-arena demo
 ```
 
-This launches the dashboard with pre-computed results from the AWS Compute corpus (75 questions, 8 strategies, 5 difficulty tiers).
+This launches the dashboard with pre-computed results from the AWS Compute corpus (75 questions, 9 strategies, 5 difficulty tiers). The demo runs in **read-only mode** — chat, arena, and tools endpoints stay disabled until you set an API key. No Docker, no Neo4j, no surprises.
+
+![Dashboard walkthrough](docs/demo-ui-walkthrough.gif)
+
+To enable live chat / arena voting / tools, set `KB_ARENA_ANTHROPIC_API_KEY` (or `KB_ARENA_OPENAI_API_KEY`, or use `KB_ARENA_LLM_PROVIDER=ollama` for free local inference).
+
+## No-API-Keys Quick Start (Ollama)
+
+```bash
+# Free local inference — no Anthropic/OpenAI keys needed
+ollama pull llama3.1:8b
+export KB_ARENA_LLM_PROVIDER=ollama
+kb-arena init-corpus my-docs && cp ~/my-docs/*.md datasets/my-docs/raw/
+kb-arena run --corpus my-docs        # one command, all stages, resumable
+kb-arena serve
+```
 
 ---
 

@@ -1,11 +1,15 @@
 services:
   neo4j:
     image: neo4j:5-community
+    # Bind to localhost only by default — exposing 7687 to 0.0.0.0 with a default
+    # password is how databases get popped on the public internet.
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
     environment:
-      - NEO4J_AUTH=neo4j/${KB_ARENA_NEO4J_PASSWORD:-kbarena1}
+      # Required: set KB_ARENA_NEO4J_PASSWORD before bringing the stack up.
+      # No fallback default — fail-closed.
+      - NEO4J_AUTH=neo4j/${KB_ARENA_NEO4J_PASSWORD:?Set KB_ARENA_NEO4J_PASSWORD before starting compose}
       - NEO4J_PLUGINS=["apoc"]
     volumes:
       - neo4j_data:/data
@@ -14,18 +18,34 @@ services:
       test: ["CMD", "neo4j", "status"]
       interval: 10s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2"
+        reservations:
+          memory: 1g
+    restart: unless-stopped
 
   api:
     build: .
+    # Public-facing — bound to 0.0.0.0, but auth defaults to demo_mode in the
+    # Dockerfile so /chat etc return 503 unless you set KB_ARENA_DEMO_MODE=false
+    # AND KB_ARENA_API_TOKEN.
     ports:
       - "8000:8000"
     environment:
       - KB_ARENA_NEO4J_URI=bolt://neo4j:7687
       - KB_ARENA_NEO4J_USER=neo4j
-      - KB_ARENA_NEO4J_PASSWORD=${KB_ARENA_NEO4J_PASSWORD:-kbarena1}
+      - KB_ARENA_NEO4J_PASSWORD=${KB_ARENA_NEO4J_PASSWORD:?Set KB_ARENA_NEO4J_PASSWORD}
       - KB_ARENA_CHROMA_PATH=/data/chroma
-      - KB_ARENA_ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - KB_ARENA_OPENAI_API_KEY=${OPENAI_API_KEY}
+      - KB_ARENA_DATASETS_PATH=/datasets
+      - KB_ARENA_RESULTS_PATH=/results
+      - KB_ARENA_ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - KB_ARENA_OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - KB_ARENA_API_TOKEN=${KB_ARENA_API_TOKEN:-}
+      - KB_ARENA_DEMO_MODE=${KB_ARENA_DEMO_MODE:-true}
+      - KB_ARENA_BENCHMARK_COST_CAP_USD=${KB_ARENA_BENCHMARK_COST_CAP_USD:-10.0}
     depends_on:
       neo4j:
         condition: service_healthy
@@ -33,6 +53,18 @@ services:
       - chroma_data:/data/chroma
       - ./datasets:/datasets
       - ./results:/results
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2"
+    restart: unless-stopped
 
   web:
     build: ./web
@@ -42,6 +74,7 @@ services:
       - NEXT_PUBLIC_API_URL=http://localhost:8000
     depends_on:
       - api
+    restart: unless-stopped
 
 volumes:
   neo4j_data:

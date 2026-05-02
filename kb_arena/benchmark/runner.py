@@ -7,6 +7,7 @@ and reliability tracking.
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from pathlib import Path
 
@@ -37,9 +38,76 @@ STRATEGY_NAMES = [
     "raptor",
     "pageindex",
     "bm25",
+    "rerank_vector",
 ]
 
 RETRY_BASE_S = 1.0  # base for exponential backoff: 1s, 2s, 4s, ...
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Distinguish transient errors (rate limit, network, server 5xx, timeout)
+    from configuration errors (auth, validation, missing model). Retrying the
+    latter just burns wall-clock and credits without ever succeeding.
+    """
+    name = type(exc).__name__
+    msg = str(exc).lower()
+
+    if isinstance(exc, TimeoutError | asyncio.TimeoutError):
+        return True
+
+    # Anthropic / OpenAI / generic SDK exception class names — match by name to
+    # avoid hard-importing every SDK at runtime.
+    transient = {
+        "RateLimitError",
+        "APITimeoutError",
+        "APIConnectionError",
+        "APIError",  # ambiguous; status_code check below narrows it
+        "InternalServerError",
+        "ServiceUnavailableError",
+    }
+    permanent = {
+        "AuthenticationError",
+        "PermissionDeniedError",
+        "BadRequestError",
+        "NotFoundError",
+        "UnprocessableEntityError",
+        "ValueError",
+        "KeyError",
+        "TypeError",
+        "AttributeError",
+    }
+    if name in permanent:
+        return False
+    if name in transient:
+        return True
+
+    # Status code embedded in message (httpx common pattern).
+    if any(code in msg for code in ("429", "500", "502", "503", "504", "timeout", "rate limit")):
+        return True
+    if any(code in msg for code in ("401", "403", "404", "400")):
+        return False
+    return False  # unknown — better to fail fast than retry forever
+
+
+def _classify_error(exc_or_message) -> str:
+    """Categorize an error for stat aggregation. Returns a stable enum-like string."""
+    if isinstance(exc_or_message, BaseException):
+        if isinstance(exc_or_message, TimeoutError | asyncio.TimeoutError):
+            return "timeout"
+        msg = str(exc_or_message).lower()
+        name = type(exc_or_message).__name__
+    else:
+        msg = str(exc_or_message).lower()
+        name = ""
+    if "timeout" in msg or "timed out" in msg or name in ("TimeoutError", "APITimeoutError"):
+        return "timeout"
+    if "rate limit" in msg or "429" in msg or name == "RateLimitError":
+        return "rate_limit"
+    if any(code in msg for code in ("connection", "connect", "dns", "resolve")):
+        return "connection"
+    if "auth" in msg or "401" in msg or "403" in msg or name == "AuthenticationError":
+        return "auth"
+    return "other"
 
 
 def _load_strategies(strategy_filter: str) -> list[Strategy]:
@@ -128,19 +196,26 @@ async def _run_one(
                     retrieval_metrics=ir_metrics,
                 )
 
-            except TimeoutError:
+            except TimeoutError as e:
                 latency_ms = (time.perf_counter() - t0) * 1000
                 last_error = f"Timeout after {query_timeout}s"
                 if attempt <= max_retries:
-                    await asyncio.sleep(RETRY_BASE_S * (2 ** (attempt - 1)))
+                    delay = RETRY_BASE_S * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                    await asyncio.sleep(delay)
                     continue
+                _ = e  # keep reference for typing
 
             except Exception as e:
                 latency_ms = (time.perf_counter() - t0) * 1000
                 last_error = str(e)
-                if attempt <= max_retries:
-                    await asyncio.sleep(RETRY_BASE_S * (2 ** (attempt - 1)))
+                # Don't retry permanent errors (bad API key, missing model, etc.)
+                # Burning 7 minutes per benchmark run on a typo is worse than failing fast.
+                if attempt <= max_retries and _is_retryable(e):
+                    delay = RETRY_BASE_S * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                    await asyncio.sleep(delay)
                     continue
+                else:
+                    break
 
         # All retries exhausted
         from kb_arena.models.benchmark import Score

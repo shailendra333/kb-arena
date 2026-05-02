@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
+import socket
 import tempfile
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -15,6 +17,51 @@ log = logging.getLogger(__name__)
 
 _MAX_DEPTH = 3
 _MAX_PAGES = 50
+
+# SSRF guard — block file://, internal IPs, and metadata endpoints.
+_BLOCKED_HOSTS = {
+    "metadata.google.internal",
+    "metadata.gce.internal",
+    "instance-data.ec2.internal",
+}
+
+
+class SSRFBlockedError(ValueError):
+    """Raised when a URL targets a private or blocked host."""
+
+
+# Backward-compat alias for any external callers that imported the old name.
+SSRFBlocked = SSRFBlockedError
+
+
+def _validate_url(url: str) -> None:
+    """Reject non-HTTP(S) schemes and IPs in private/loopback/link-local ranges.
+
+    Resolves DNS and checks the resolved IP, so attackers can't use a domain that
+    resolves to 127.0.0.1 or 169.254.169.254 (AWS metadata).
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise SSRFBlocked(f"only http/https schemes allowed, got {parsed.scheme!r}")
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise SSRFBlocked("missing host")
+    if host in _BLOCKED_HOSTS:
+        raise SSRFBlocked(f"blocked host: {host}")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise SSRFBlocked(f"dns resolution failed for {host}: {exc}") from exc
+    for info in infos:
+        ip_str = info[4][0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
+            raise SSRFBlocked(f"refusing to fetch private address {ip_str} ({host})")
+        if ip.is_reserved or ip.is_unspecified:
+            raise SSRFBlocked(f"refusing to fetch reserved address {ip_str} ({host})")
 
 
 def _try_import_httpx():
@@ -39,14 +86,32 @@ def _try_import_bs4():
         ) from None
 
 
+def _safe_get(client, url: str, timeout: int = 15, max_redirects: int = 5):
+    """GET a URL with SSRF validation on every hop. Disables auto-follow_redirects."""
+    current = url
+    for _ in range(max_redirects + 1):
+        _validate_url(current)
+        resp = client.get(current, timeout=timeout, follow_redirects=False)
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("location")
+            if not location:
+                return resp
+            current = urljoin(current, location)
+            continue
+        return resp
+    raise SSRFBlocked(f"too many redirects starting from {url}")
+
+
 def _check_llms_txt(base_url: str, client) -> str | None:
     parsed = urlparse(base_url)
     llms_url = f"{parsed.scheme}://{parsed.netloc}/llms.txt"
     try:
-        resp = client.get(llms_url, timeout=10, follow_redirects=True)
+        resp = _safe_get(client, llms_url, timeout=10)
         if resp.status_code == 200 and len(resp.text) > 50:
             log.info("Found llms.txt at %s — using as primary source", llms_url)
             return resp.text
+    except SSRFBlocked as exc:
+        log.warning("llms.txt blocked: %s", exc)
     except Exception:  # noqa: BLE001
         log.debug("llms.txt check failed for %s", llms_url, exc_info=True)
     return None
@@ -80,10 +145,12 @@ def _extract_links(html: str, base_url: str, bs_class) -> list[str]:
 
 def _fetch_page(url: str, client) -> str | None:
     try:
-        resp = client.get(url, timeout=15, follow_redirects=True)
+        resp = _safe_get(client, url, timeout=15)
         content_type = resp.headers.get("content-type", "")
         if resp.status_code == 200 and "text/html" in content_type:
             return resp.text
+    except SSRFBlocked as exc:
+        log.warning("Refusing to fetch %s: %s", url, exc)
     except Exception as exc:  # noqa: BLE001
         log.warning("Failed to fetch %s: %s", url, exc)
     return None
@@ -110,11 +177,18 @@ class WebParser:
         return self._scrape(url, corpus)
 
     def _scrape(self, url: str, corpus: str) -> list[Document]:
+        try:
+            _validate_url(url)
+        except SSRFBlocked as exc:
+            log.error("Refusing to scrape %s: %s", url, exc)
+            return []
+
         httpx = _try_import_httpx()
         bs_class = _try_import_bs4()
 
         with httpx.Client(
             headers={"User-Agent": "kb-arena/1.0 (documentation indexer)"},
+            follow_redirects=False,
         ) as client:
             # llms.txt takes priority over crawling
             llms_txt = _check_llms_txt(url, client)

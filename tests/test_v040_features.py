@@ -111,10 +111,12 @@ class TestEvalMemoization:
 
 class TestCostCap:
     def test_default_cost_cap(self):
+        # As of v0.6.0 the default flipped from 0.0 (unlimited) to 10.0 USD —
+        # closes the financial-DoS cost-bomb finding from the security audit.
         from kb_arena.settings import Settings
 
         s = Settings()
-        assert s.benchmark_cost_cap_usd == 0.0
+        assert s.benchmark_cost_cap_usd == 10.0
 
     def test_ragas_setting(self):
         from kb_arena.settings import Settings

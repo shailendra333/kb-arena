@@ -17,7 +17,7 @@ from kb_arena.models.document import Document, Section
 from kb_arena.models.retrieval import RetrievalTrace, RetrievedChunk
 from kb_arena.settings import settings
 from kb_arena.strategies.base import AnswerResult, Strategy
-from kb_arena.strategies.embeddings import OpenAIEmbedding
+from kb_arena.strategies.embeddings import get_embedding_function
 
 COLLECTION_NAME = "qna_pairs"
 
@@ -50,7 +50,7 @@ class QnAPairStrategy(Strategy):
 
     def _get_collection(self):
         if self._collection is None:
-            ef = OpenAIEmbedding()
+            ef = get_embedding_function()
             self._collection = self._get_client().get_or_create_collection(
                 name=COLLECTION_NAME,
                 embedding_function=ef,

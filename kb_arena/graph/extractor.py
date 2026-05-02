@@ -117,8 +117,10 @@ def _validate_result(raw: dict, corpus: str, section_id: str) -> ExtractionResul
         if not valid_rel_type(corpus, r.get("type", "")):
             logger.debug("Rejected rel type '%s' (not in schema)", r.get("type"))
             continue
-        # Drop edges referencing entities not in this extraction batch
-        if r.get("source_fqn") not in seen_fqns or r.get("target_fqn") not in seen_fqns:
+        # NOTE: do not drop edges referencing entities outside this section batch.
+        # Cross-section edges are essential for multi-hop graph queries and are
+        # validated globally after all sections have been extracted (see run_extraction).
+        if not r.get("source_fqn") or not r.get("target_fqn"):
             continue
         relationships.append(
             Relationship(
@@ -280,6 +282,27 @@ async def run_extraction(corpus: str = "custom", schema: str = "auto", event_cal
                         },
                     }
                 )
+
+    # Cross-section edge validation: keep only edges whose endpoints exist in the
+    # global entity set. Entities are extracted per-section but documentation
+    # routinely contains cross-section relationships (e.g. Lambda -> API Gateway
+    # in different sections). Validating against the union preserves these.
+    global_fqns: set[str] = {e.fqn for e in all_entities if e.fqn}
+    valid_relationships: list[Relationship] = []
+    dropped = 0
+    for r in all_relationships:
+        if r.source_fqn in global_fqns and r.target_fqn in global_fqns:
+            valid_relationships.append(r)
+        else:
+            dropped += 1
+    if dropped:
+        logger.info(
+            "Dropped %d edges referencing entities not in global FQN set "
+            "(out of %d cross-section edges)",
+            dropped,
+            len(all_relationships),
+        )
+    all_relationships = valid_relationships
 
     # Group by type for batch loading — nodes first, then edges
     from collections import defaultdict

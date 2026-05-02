@@ -87,14 +87,21 @@ def test_validate_result_rejects_unknown_rel_type():
     assert result.relationships == []
 
 
-def test_validate_result_drops_dangling_relationships():
-    """Relationships referencing fqns not in the entity list are dropped."""
+def test_validate_result_keeps_cross_section_relationships():
+    """As of v0.6.0, cross-section relationships are NOT dropped at validation time.
+
+    Per-section validation no longer requires both endpoints to live in the same
+    extraction batch. The global FQN union check happens later in run_extraction
+    (after every section has been extracted), so multi-hop graph queries
+    structurally work.
+    """
     payload = {
         "entities": [_VALID_LLM_RESPONSE["entities"][0]],  # only aws.lambda.invoke
         "relationships": list(_VALID_LLM_RESPONSE["relationships"]),  # refs aws.iam.execution-role
     }
     result = _validate_result(payload, AWS_CORPUS, "s1")
-    assert result.relationships == []
+    # Edge with both endpoints set is kept; the global pass deduplicates later.
+    assert len(result.relationships) == len(_VALID_LLM_RESPONSE["relationships"])
 
 
 @pytest.mark.asyncio

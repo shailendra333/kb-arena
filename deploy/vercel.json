@@ -1,0 +1,22 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "name": "kb-arena-demo",
+  "version": 2,
+  "framework": "nextjs",
+  "buildCommand": "cd web && npm install && npx next build",
+  "outputDirectory": "web/.next",
+  "installCommand": "cd web && npm install",
+  "env": {
+    "NEXT_PUBLIC_API_URL": "https://kb-arena-api.fly.dev"
+  },
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Frame-Options", "value": "DENY" },
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" }
+      ]
+    }
+  ]
+}

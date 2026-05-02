@@ -19,9 +19,25 @@ app = typer.Typer(
 console = Console()
 
 
+def _print_version(value: bool) -> None:
+    if value:
+        from kb_arena import __version__
+
+        console.print(f"kb-arena {__version__}")
+        raise typer.Exit()
+
+
 @app.callback()
 def _setup(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
+    version: bool = typer.Option(  # noqa: ARG001 — handled by callback
+        False,
+        "--version",
+        "-V",
+        help="Print kb-arena version and exit.",
+        callback=_print_version,
+        is_eager=True,
+    ),
 ) -> None:
     level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(
@@ -66,14 +82,36 @@ def _preflight(
     needs_openai: bool = False,
     needs_neo4j: bool = False,
 ) -> None:
+    """Verify that the credentials this command actually needs are configured.
+
+    Honors `KB_ARENA_LLM_PROVIDER`: when set to `ollama`, neither Anthropic nor
+    OpenAI keys are required. When set to `openai`, an Anthropic key is not
+    required either.
+    """
     from kb_arena.settings import settings
+
+    provider = settings.llm_provider
+
+    # Provider-specific overrides — Ollama needs nothing, OpenAI needs only OpenAI.
+    if provider == "ollama":
+        needs_anthropic = False
+        # Embeddings — when on Ollama, we expect an Ollama embedding model;
+        # the OpenAI key requirement only applies to OpenAI/Anthropic providers.
+        needs_openai = False
+    elif provider == "openai":
+        needs_anthropic = False
 
     errors: list[str] = []
     if needs_anthropic and not settings.anthropic_api_key:
-        errors.append("Anthropic API key required. Set KB_ARENA_ANTHROPIC_API_KEY in .env")
+        errors.append(
+            "Anthropic API key required. Set KB_ARENA_ANTHROPIC_API_KEY, "
+            "or use KB_ARENA_LLM_PROVIDER=ollama for free local inference."
+        )
     if needs_openai and not settings.openai_api_key:
         errors.append(
-            "OpenAI API key required (for embeddings). Set KB_ARENA_OPENAI_API_KEY in .env"
+            "OpenAI API key required (for embeddings). "
+            "Set KB_ARENA_OPENAI_API_KEY, or switch the embedding provider via "
+            "KB_ARENA_EMBEDDING_PROVIDER (bge, ollama, voyage, cohere)."
         )
     if errors:
         for e in errors:
@@ -406,7 +444,15 @@ def init_corpus(
 
     Creates datasets/{name}/ with raw/, processed/, questions/ subdirectories.
     """
+    import re
     from pathlib import Path
+
+    if not re.match(r"^[a-zA-Z0-9_-]+$", name):
+        console.print(
+            f"[red]Invalid corpus name '{name}'. "
+            "Use only letters, digits, hyphens, underscores.[/red]"
+        )
+        raise typer.Exit(1)
 
     base = Path("datasets") / name
     if base.exists():
@@ -416,12 +462,170 @@ def init_corpus(
     for subdir in ["raw", "processed", "questions"]:
         (base / subdir).mkdir(parents=True, exist_ok=True)
 
+    # Drop a sample question YAML so users can see the schema without reading docs.
+    sample_q = base / "questions" / "tier1_factoid.yaml.example"
+    sample_q.write_text(
+        "# Rename to tier1_factoid.yaml to activate. One YAML per tier.\n"
+        "- id: my-docs-t1-001\n"
+        '  question: "What is X?"\n'
+        "  tier: 1\n"
+        "  type: factoid\n"
+        "  ground_truth:\n"
+        '    answer_summary: "X is ..."\n'
+        '    must_mention: ["X"]\n'
+        "    must_not_claim: []\n"
+        "    source_refs: []\n",
+        encoding="utf-8",
+    )
+
     console.print(f"[green]Created corpus scaffold:[/green] {base}/")
-    console.print("  raw/         ← drop your documents here")
-    console.print("  processed/   ← ingest output goes here")
-    console.print("  questions/   ← benchmark questions (YAML)")
+    console.print("  raw/         <- drop your documents here")
+    console.print("  processed/   <- ingest output goes here")
+    console.print("  questions/   <- benchmark questions (YAML, see sample)")
     console.print()
-    console.print(f"Next: [bold]kb-arena ingest {base}/raw/ --corpus {name}[/bold]")
+    console.print(
+        f"Next: [bold]kb-arena run --corpus {name}[/bold] "
+        "(orchestrates ingest -> build-graph -> build-vectors -> benchmark)"
+    )
+
+
+@app.command()
+def run(
+    corpus: str = typer.Option(..., help="Corpus to run end-to-end"),
+    docs: str | None = typer.Option(  # noqa: UP045
+        None,
+        "--docs",
+        help="Optional path/URL/github: spec to ingest before building. "
+        "If omitted, ingest is skipped (assumes docs already in datasets/{corpus}/raw/).",
+    ),
+    skip_graph: bool = typer.Option(
+        False, "--skip-graph", help="Skip build-graph (useful when Neo4j is unavailable)"
+    ),
+    questions: int = typer.Option(50, help="Auto-generate this many questions if none exist"),
+    resume: bool = typer.Option(
+        True, "--resume/--no-resume", help="Skip stages whose outputs already exist"
+    ),
+):
+    """One-shot pipeline: ingest -> build-graph -> build-vectors -> generate-questions -> benchmark.
+
+    Each stage writes a checkpoint to datasets/{corpus}/.pipeline_state.json so a
+    subsequent run --resume picks up where the last one stopped. Stages whose
+    output is already on disk are skipped automatically.
+    """
+    import asyncio
+    import json
+    import re
+    from pathlib import Path
+
+    from rich.panel import Panel
+
+    if not re.match(r"^[a-zA-Z0-9_-]+$", corpus):
+        console.print(f"[red]Invalid corpus name '{corpus}'.[/red]")
+        raise typer.Exit(1)
+
+    base = Path("datasets") / corpus
+    if not base.exists():
+        console.print(
+            f"[red]Corpus directory not found: {base}\n" f"Run: kb-arena init-corpus {corpus}[/red]"
+        )
+        raise typer.Exit(1)
+
+    state_path = base / ".pipeline_state.json"
+    state: dict = {}
+    if resume and state_path.exists():
+        try:
+            state = json.loads(state_path.read_text())
+        except json.JSONDecodeError:
+            state = {}
+
+    def _save_state() -> None:
+        state_path.write_text(json.dumps(state, indent=2))
+
+    def _stage(name: str, action) -> None:
+        if resume and state.get(name) == "done":
+            console.print(f"[dim][skip][/dim] {name} already complete")
+            return
+        console.print(Panel.fit(f"[bold]{name}[/bold]", style="cyan"))
+        action()
+        state[name] = "done"
+        _save_state()
+
+    # 1. ingest (optional)
+    if docs:
+        from kb_arena.ingest.pipeline import run_ingest
+
+        def _ingest():
+            run_ingest(path=docs, corpus=corpus, format="auto")
+
+        _stage("ingest", _ingest)
+    else:
+        # If processed/ is empty AND no --docs given, we cannot proceed.
+        processed = base / "processed"
+        if not processed.exists() or not any(processed.glob("*.jsonl")):
+            console.print(
+                "[red]No processed documents found and no --docs path given.[/red]\n"
+                f"Drop files into {base / 'raw'}/ then re-run with --docs {base / 'raw'}, "
+                "or run kb-arena ingest separately."
+            )
+            raise typer.Exit(1)
+
+    # 2. build-graph (skippable when Neo4j is unavailable)
+    if not skip_graph:
+        from kb_arena.graph.extractor import run_extraction
+
+        def _graph():
+            try:
+                asyncio.run(run_extraction(corpus=corpus))
+            except Exception as exc:  # noqa: BLE001 — surface as warning, continue
+                console.print(
+                    f"[yellow]build-graph failed: {exc}\n"
+                    "Continuing with vector strategies. "
+                    "Re-run with Neo4j running to enable knowledge_graph + hybrid.[/yellow]"
+                )
+                # Graceful degradation: don't mark stage done so future --resume retries.
+                raise typer.Exit(0)  # leave state unset so we can retry
+
+        _stage("build_graph", _graph)
+    else:
+        console.print("[dim][skip][/dim] build_graph (--skip-graph)")
+
+    # 3. build-vectors (always)
+    from kb_arena.strategies import build_vector_indexes
+
+    def _vectors():
+        asyncio.run(build_vector_indexes(corpus=corpus))
+
+    _stage("build_vectors", _vectors)
+
+    # 4. generate-questions (only if no questions exist)
+    has_questions = (base / "questions").exists() and any((base / "questions").glob("*.yaml"))
+    if not has_questions:
+        from kb_arena.benchmark.question_gen import run_question_generation
+
+        def _questions():
+            asyncio.run(run_question_generation(corpus=corpus, count=questions))
+
+        _stage("generate_questions", _questions)
+    else:
+        console.print("[dim][skip][/dim] generate_questions (questions already exist)")
+
+    # 5. benchmark
+    from kb_arena.benchmark.runner import run_benchmark
+
+    def _bench():
+        asyncio.run(run_benchmark(corpus=corpus, strategy="all"))
+
+    _stage("benchmark", _bench)
+
+    console.print()
+    console.print(
+        Panel.fit(
+            "[bold green]Pipeline complete[/bold green]\n\n"
+            f"Run [bold]kb-arena serve[/bold] to explore results in the dashboard,\n"
+            f"or [bold]kb-arena report --corpus {corpus}[/bold] for a Markdown summary.",
+            style="green",
+        )
+    )
 
 
 @app.command()

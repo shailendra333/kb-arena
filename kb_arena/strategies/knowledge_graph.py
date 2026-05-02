@@ -19,10 +19,23 @@ from kb_arena.strategies.base import AnswerResult, Strategy
 
 logger = logging.getLogger(__name__)
 
-# Reject LLM-generated Cypher that contains write operations
+# Reject LLM-generated Cypher that contains write operations.
+# Note: this is layer 1; layer 2 is the read-only session below in _run_cypher
+# which the Neo4j driver enforces at the protocol level. APOC procedures with
+# write semantics need an explicit deny because some run inside read-marked sessions.
 _WRITE_CYPHER_RE = re.compile(
-    r"\b(CREATE|MERGE|SET|DELETE|REMOVE|DROP|DETACH|CALL\s+apoc\.schema)\b",
-    re.IGNORECASE,
+    r"""\b(
+        CREATE | MERGE | SET | DELETE | REMOVE | DROP | DETACH
+      | LOAD\s+CSV
+      | CALL\s+apoc\.(?:
+            schema | create | merge | refactor | delete | remove | set | drop
+          | iterate | periodic\.iterate
+          | cypher\.runWrite | cypher\.doIt
+          | export | load | trigger
+        )
+      | CALL\s+dbms\.security\.
+    )\b""",
+    re.IGNORECASE | re.VERBOSE,
 )
 
 # --- Cypher templates (Pattern 6 from PLAN.md) ---
@@ -240,10 +253,21 @@ class KnowledgeGraphStrategy(Strategy):
         pass
 
     async def _run_cypher(self, cypher: str, params: dict) -> list[dict]:
-        """Execute Cypher and return list of record dicts."""
+        """Execute Cypher in a read-only session.
+
+        Defense in depth — even if the LLM emits a write the driver rejects it
+        at the Bolt protocol level. The regex above catches APOC write paths
+        that some Neo4j builds smuggle through read-marked sessions.
+        """
         if self._driver is None:
             return []
-        async with self._driver.session() as session:
+        try:
+            import neo4j as _neo4j
+
+            session_kwargs = {"default_access_mode": _neo4j.READ_ACCESS}
+        except ImportError:  # pragma: no cover — neo4j is a hard dep
+            session_kwargs = {}
+        async with self._driver.session(**session_kwargs) as session:
             result = await session.run(cypher, parameters=params)
             records = await result.data()
             await result.consume()

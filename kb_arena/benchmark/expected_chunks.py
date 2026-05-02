@@ -90,38 +90,75 @@ async def label_one_question(
     bm25: BM25Strategy,
     llm: LLMClient,
     n_candidates: int = 20,
+    extra_retrievers: list | None = None,
 ) -> tuple[list[str], float]:
-    """Returns (relevant_chunk_ids, cost_usd) for a single question."""
-    result = await bm25.query(question_text, top_k=n_candidates)
-    if not result.retrieval or not result.retrieval.retrieved:
-        return [], 0.0
+    """Returns (relevant_chunk_ids, cost_usd) for a single question.
 
-    candidates_text = "\n\n".join(
-        f"[{c.chunk_id}] {c.content[:400]}" for c in result.retrieval.retrieved
+    Builds the candidate pool from the UNION of every retriever in
+    `extra_retrievers` plus BM25 — not BM25 alone. Otherwise the gold set is
+    structurally limited to chunks BM25 would surface, which biases IR metrics
+    in favour of keyword-overlap strategies.
+    """
+    result = await bm25.query(question_text, top_k=n_candidates)
+    candidates: list = (
+        list(result.retrieval.retrieved) if result.retrieval and result.retrieval.retrieved else []
     )
+    cost = 0.0
+
+    if extra_retrievers:
+        for retriever in extra_retrievers:
+            try:
+                extra_result = await retriever.query(question_text, top_k=n_candidates)
+            except Exception as exc:  # noqa: BLE001 — best-effort extras
+                log.warning("Extra retriever %s failed: %s", retriever.name, exc)
+                continue
+            if extra_result.retrieval and extra_result.retrieval.retrieved:
+                candidates.extend(extra_result.retrieval.retrieved)
+            cost += float(getattr(extra_result, "cost_usd", 0.0) or 0.0)
+
+    if not candidates:
+        return [], cost
+
+    # Deduplicate by chunk_id, keep the highest-ranked instance.
+    by_id: dict[str, object] = {}
+    for c in candidates:
+        cid = c.chunk_id
+        existing = by_id.get(cid)
+        if existing is None or c.rank < existing.rank:  # type: ignore[attr-defined]
+            by_id[cid] = c
+    deduped = list(by_id.values())
+
+    candidates_text = "\n\n".join(f"[{c.chunk_id}] {c.content[:400]}" for c in deduped)
     prompt = JUDGE_PROMPT.format(question=question_text, candidates=candidates_text)
 
     resp = await llm.extract(
         text=prompt,
         system_prompt="You output only a JSON array literal. No prose. No markdown.",
     )
-    valid = {c.chunk_id for c in result.retrieval.retrieved}
+    cost += float(resp.cost_usd or 0.0)
+    valid = {c.chunk_id for c in deduped}
     array_text = _extract_json_array(resp.text)
     if array_text is None:
         log.warning("No JSON array in judge output: %.200s", resp.text)
-        return [], resp.cost_usd
+        return [], cost
     try:
         ids = json.loads(array_text)
     except json.JSONDecodeError:
         log.warning("Failed to parse judge output: %.200s", array_text)
-        return [], resp.cost_usd
+        return [], cost
     if not isinstance(ids, list):
-        return [], resp.cost_usd
-    return [str(x) for x in ids if str(x) in valid], resp.cost_usd
+        return [], cost
+    return [str(x) for x in ids if str(x) in valid], cost
 
 
 async def label_corpus(corpus: str, force: bool = False, n_candidates: int = 20) -> dict:
-    """Label every question in a corpus. Idempotent unless force=True. Cost-capped."""
+    """Label every question in a corpus. Idempotent unless force=True. Cost-capped.
+
+    Candidate pool is the union of BM25 + naive_vector + contextual_vector top-N
+    when those indexes exist. If only BM25 is built, we still proceed (with a
+    documented bias warning) so users running label-chunks before build-vectors
+    aren't blocked.
+    """
     questions = load_questions(corpus)
     bm25 = BM25Strategy()
     if not bm25._ensure_index(corpus):
@@ -130,6 +167,36 @@ async def label_corpus(corpus: str, force: bool = False, n_candidates: int = 20)
             f"{corpus} --strategy bm25"
         )
     llm = LLMClient()
+
+    # Best-effort extra retrievers — silently skip if their index isn't built yet.
+    extra_retrievers: list = []
+    try:
+        import chromadb
+
+        from kb_arena.strategies.contextual_vector import ContextualVectorStrategy
+        from kb_arena.strategies.naive_vector import NaiveVectorStrategy
+
+        chroma = chromadb.PersistentClient(path=settings.chroma_path)
+        for cls in (NaiveVectorStrategy, ContextualVectorStrategy):
+            try:
+                inst = cls(chroma_client=chroma)
+                # Probe — query a trivial string; failure means no index built.
+                await inst.query("kb_arena_index_probe", top_k=1)
+                extra_retrievers.append(inst)
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                log.info(
+                    "Skipping %s for ground-truth pool (index not ready: %s)",
+                    cls.__name__,
+                    exc,
+                )
+    except ImportError:
+        pass
+
+    if not extra_retrievers:
+        log.warning(
+            "Ground-truth pool is BM25-only — vector indexes not built yet. "
+            "For unbiased labels run `kb-arena build-vectors` first, then re-label."
+        )
 
     out_path = (
         settings.datasets_path
@@ -163,7 +230,9 @@ async def label_corpus(corpus: str, force: bool = False, n_candidates: int = 20)
             log.warning("Cost cap reached at $%.2f", total_cost)
             halted = True
             break
-        ids, cost = await label_one_question(q.question, bm25, llm, n_candidates)
+        ids, cost = await label_one_question(
+            q.question, bm25, llm, n_candidates, extra_retrievers=extra_retrievers
+        )
         total_cost += cost
         out_dict[q.id] = ids
         labeled += 1

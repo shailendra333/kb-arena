@@ -41,9 +41,19 @@ class Settings(BaseSettings):
     # ChromaDB
     chroma_path: str = "./chroma_data"
 
-    # Embeddings — text-embedding-3-large is the latest/best OpenAI embedding model
+    # Embeddings — provider-agnostic. Pick via KB_ARENA_EMBEDDING_PROVIDER:
+    # openai (default), voyage, cohere, bge (local), ollama (local), gemini.
+    embedding_provider: str = "openai"
     embedding_model: str = "text-embedding-3-large"
     embedding_dimensions: int = 3072
+    ollama_embedding_model: str = "nomic-embed-text"
+    voyage_api_key: str = ""
+    cohere_api_key: str = ""
+    gemini_api_key: str = ""
+
+    # Reranker — used by the rerank_vector strategy (#9). Backends: bge | cohere | voyage.
+    reranker_backend: str = "bge"
+    reranker_model: str = ""  # blank = backend default
 
     # Server
     host: str = "0.0.0.0"
@@ -52,12 +62,22 @@ class Settings(BaseSettings):
     cors_origins: list[str] = []  # Override via KB_ARENA_CORS_ORIGINS='["http://myapp:3000"]'
     session_ttl_minutes: int = 30
 
+    # API auth — when set, requests must include `Authorization: Bearer <token>`.
+    # When unset, the API runs in open mode (only safe for localhost dev).
+    api_token: str = ""
+    # Demo mode: when true, /chat, /chat/stream, /api/arena/*, /api/tools/*,
+    # /api/graph/build, /api/debug/explain return 503. Used by the hosted public demo.
+    demo_mode: bool = False
+    # Trusted reverse-proxy header for client IP rate limiting (e.g. "x-forwarded-for").
+    trusted_proxy_header: str = ""
+
     # Benchmark
     benchmark_temperature: float = 0.0
     benchmark_max_concurrent: int = 5
     benchmark_query_timeout_s: int = 120
     benchmark_max_retries: int = 2
-    benchmark_cost_cap_usd: float = 0.0  # 0 = unlimited; halt if cumulative cost exceeds
+    # Default budget guard: 10 USD. Set to 0 to disable. Halts run when cumulative cost exceeds.
+    benchmark_cost_cap_usd: float = 10.0
     benchmark_enable_ragas: bool = False  # enable RAGAS metrics (adds 4 LLM calls per question)
 
     # PageIndex

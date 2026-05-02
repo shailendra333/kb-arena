@@ -8,32 +8,63 @@ from pydantic import BaseModel, Field, field_validator
 
 from kb_arena.models.graph import GraphContext
 
+MAX_QUERY_LEN = 4000
+# Cap chat history at ~25 user+assistant turn pairs (50 messages). Existing
+# tests assert 20 full turns are accepted; well above any realistic UI window.
+MAX_HISTORY_TURNS = 50
+# Past messages can be longer than a single new query (e.g. a previously-pasted
+# document) — cap them generously but not unbounded.
+MAX_MESSAGE_CONTENT_LEN = 32_000
+
 
 class Message(BaseModel):
     """A single chat message."""
 
     role: Literal["user", "assistant"]
-    content: str
+    content: str = Field(max_length=MAX_MESSAGE_CONTENT_LEN)
 
 
 class ChatRequest(BaseModel):
     """Request body for /chat endpoint."""
 
-    query: str
-    strategy: str = "hybrid"
-    history: list[Message] = Field(default_factory=list)
-    corpus: str = "aws-compute"
+    query: str = Field(min_length=1, max_length=MAX_QUERY_LEN)
+    strategy: str = Field(default="hybrid", max_length=64)
+    history: list[Message] = Field(default_factory=list, max_length=MAX_HISTORY_TURNS)
+    corpus: str = Field(default="aws-compute", max_length=64)
 
-    @field_validator("corpus")
+    @field_validator("corpus", "strategy")
     @classmethod
-    def validate_corpus(cls, v: str) -> str:
+    def _validate_identifier(cls, v: str) -> str:
         import re
 
         if not re.match(r"^[a-zA-Z0-9_-]+$", v):
             raise ValueError(
-                "Invalid corpus name: must contain only letters, digits, hyphens, underscores"
+                "Invalid identifier: must contain only letters, digits, hyphens, underscores"
             )
         return v
+
+
+class ArenaMatchRequest(BaseModel):
+    """Request body for /api/arena/match."""
+
+    question: str = Field(min_length=1, max_length=MAX_QUERY_LEN)
+    corpus: str = Field(default="aws-compute", max_length=64)
+
+    @field_validator("corpus")
+    @classmethod
+    def _validate_corpus(cls, v: str) -> str:
+        import re
+
+        if not re.match(r"^[a-zA-Z0-9_-]+$", v):
+            raise ValueError("Invalid corpus name")
+        return v
+
+
+class ArenaVoteRequest(BaseModel):
+    """Request body for /api/arena/vote."""
+
+    match_id: str = Field(min_length=1, max_length=64)
+    winner: Literal["a", "b", "tie"]
 
 
 class ChatResponse(BaseModel):

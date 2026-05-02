@@ -1,4 +1,4 @@
-"""Retrieval strategies — 7 approaches to answering questions from documentation."""
+"""Retrieval strategies — 9 approaches to answering questions from documentation."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from kb_arena.strategies.naive_vector import NaiveVectorStrategy
 from kb_arena.strategies.pageindex import PageIndexStrategy
 from kb_arena.strategies.qna_pairs import QnAPairStrategy
 from kb_arena.strategies.raptor import RaptorStrategy
+from kb_arena.strategies.rerank_vector import RerankVectorStrategy
 
 logger = logging.getLogger(__name__)
 _console = Console()
@@ -31,6 +32,7 @@ STRATEGY_REGISTRY: dict[str, type] = {
     "raptor": RaptorStrategy,
     "pageindex": PageIndexStrategy,
     "bm25": BM25Strategy,
+    "rerank_vector": RerankVectorStrategy,
 }
 
 
@@ -161,7 +163,7 @@ def get_strategy(name: str):
         return cls()
 
     # Vector-backed strategies need a ChromaDB client
-    if name in ("naive_vector", "contextual_vector", "qna_pairs", "raptor"):
+    if name in ("naive_vector", "contextual_vector", "qna_pairs", "raptor", "rerank_vector"):
         chroma = chromadb.PersistentClient(path=settings.chroma_path)
         return cls(chroma_client=chroma)
 
@@ -177,17 +179,22 @@ def get_strategy(name: str):
             logger.warning("Neo4j not available for %s: %s — using mock fallback", name, e)
             return cls()
 
-    # Hybrid needs both
+    # Hybrid needs both, plus the IntentRouter for the advertised three-stage classification.
     if name == "hybrid":
+        from kb_arena.chatbot.router import IntentRouter
+        from kb_arena.llm.client import LLMClient
+
         chroma = chromadb.PersistentClient(path=settings.chroma_path)
+        llm = LLMClient()
+        router = IntentRouter(llm=llm)
         try:
             driver = AsyncGraphDatabase.driver(
                 settings.neo4j_uri,
                 auth=(settings.neo4j_user, settings.neo4j_password),
             )
-            return cls(chroma_client=chroma, neo4j_driver=driver)
+            return cls(chroma_client=chroma, neo4j_driver=driver, router=router, llm=llm)
         except Exception:
-            return cls(chroma_client=chroma)
+            return cls(chroma_client=chroma, router=router, llm=llm)
 
     return cls()
 
@@ -203,6 +210,7 @@ __all__ = [
     "RaptorStrategy",
     "PageIndexStrategy",
     "BM25Strategy",
+    "RerankVectorStrategy",
     "build_vector_indexes",
     "load_documents",
 ]

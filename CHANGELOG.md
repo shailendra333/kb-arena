@@ -2,6 +2,90 @@
 
 All notable changes to KB Arena.
 
+## [0.6.0] — 2026-05-02 — Hardening, 9th strategy, embedding providers, public leaderboard
+
+### Added
+- **Strategy #9: `rerank_vector`** — Naive Vector + cross-encoder reranking with three backends:
+  `bge` (BAAI/bge-reranker-v2-m3, local, free, default), `cohere` (Rerank v3.5/v4),
+  `voyage` (Rerank 2.5). Selects via `KB_ARENA_RERANKER_BACKEND`.
+- **Embedding provider abstraction** — `KB_ARENA_EMBEDDING_PROVIDER` selects
+  `openai` (default), `voyage` (current MTEB retrieval leader), `cohere`, `bge`
+  (local, no key), `ollama` (local, no key), or `gemini`. All four vector
+  strategies route through `get_embedding_function()` instead of hard-coded OpenAI.
+- **`kb-arena run --corpus my-docs --resume`** — one-shot orchestrator that
+  ingests, builds graph, builds vectors, generates questions, and benchmarks,
+  with a checkpoint at `datasets/{corpus}/.pipeline_state.json` so a re-run
+  with `--resume` skips finished stages.
+- **Public read-only `/api/leaderboard`** + Next.js `/leaderboard` page —
+  aggregates every benchmark run in `results/run_*` per (corpus, strategy)
+  with mean accuracy, Recall@5, NDCG@5, cost, and latency. No auth.
+- **Bearer-token auth** (`KB_ARENA_API_TOKEN`) on every LLM-triggering endpoint;
+  bounded-deque rate limiter with optional trusted-proxy header support.
+- **Demo mode** (`KB_ARENA_DEMO_MODE`) — auto-enabled when no API key is configured;
+  every LLM-triggering endpoint returns 503 while the static dashboard,
+  leaderboard, benchmark results, and corpora endpoints remain available.
+- `kb-arena --version` flag.
+- `deploy/vercel.json` and `deploy/huggingface_space.yaml` for hosted demos.
+- `docs/tapes/hero-demo.tape`, `docs/tapes/retriever-lab.tape`, and
+  `docs/tapes/record-ui.py` so demo GIFs regenerate deterministically.
+
+### Changed
+- **Hybrid strategy** — procedural branch now reranks **passages** (real
+  `RetrievedChunk.content`) instead of previously-generated answer strings,
+  and uses Reciprocal Rank Fusion (k=60) instead of LLM-pairwise rerank.
+  Vector + graph queries now run via `asyncio.gather`. IntentRouter is wired
+  in `get_strategy("hybrid")` so the advertised three-stage classification
+  actually fires.
+- **Knowledge graph extraction** — cross-section relationships are no longer
+  dropped at section validation. A global FQN union check happens after every
+  section has been extracted, restoring multi-hop graph queries.
+- **Ground-truth labelling** — `expected_chunks.yaml` candidate pool widened
+  from BM25 alone to BM25 ∪ naive_vector ∪ contextual_vector top-N when the
+  vector indexes are built. Closes the circular-methodology critique.
+- **Default `KB_ARENA_BENCHMARK_COST_CAP_USD` is 10.0** (was 0 / unlimited).
+- **`SECURITY.md`** rewritten to match implementation; supported versions
+  refreshed to 0.6.x.
+- **Dockerfile** runs as non-root `kbarena` user with HEALTHCHECK and a
+  default `KB_ARENA_DEMO_MODE=true` so a freshly built image cannot drain
+  credits without explicit opt-in.
+- **`docker-compose.yml`** fail-closes when `KB_ARENA_NEO4J_PASSWORD` is
+  unset, binds Neo4j to 127.0.0.1, adds resource limits and api healthcheck.
+- README hero rewritten with the question-frame pitch
+  ("Should you use Graph RAG, Vector RAG, or Hybrid?") and a No-API-Keys
+  Quick Start using Ollama.
+
+### Fixed
+- **Cross-tenant data leak** — `Strategy.last_*` fields were stomped by
+  concurrent SSE consumers. Per-call metrics now travel with the streamed
+  tokens via a `_kb_arena_meta` packet; the `last_*` fields stay only as a
+  back-compat surface for plugins.
+- **`bm25` strategy missing from bundled demo** — `kb_arena/data/aws-compute_bm25.json`
+  is now shipped, plus a hatch `force-include` glob so future strategies are
+  picked up automatically.
+- **`kb-arena demo` zero-config gate** — lifespan tolerates missing API keys,
+  enables `demo_mode`, and continues serving the dashboard.
+- **Ollama free path** — `_preflight()` reads `settings.llm_provider` and
+  skips Anthropic/OpenAI key checks when set to `ollama`.
+- **APOC Cypher write bypass** — write regex now also rejects
+  `apoc.create|merge|refactor|delete|remove|set|drop|iterate|cypher.runWrite|export|trigger`,
+  and every read path opens the Neo4j session with `default_access_mode=READ_ACCESS`.
+- **SSRF in `kb-arena ingest <url>`** — `WebParser` rejects `file://`, private,
+  loopback, link-local, multicast, and reserved IPs (post-DNS); blocks AWS / GCE
+  metadata hostnames; disables auto-redirect with per-hop validation.
+- **Cost-bomb on chat / arena / tools** — every LLM-triggering endpoint is now
+  rate-limited and `Field(max_length=4000)`-bounded; arena endpoints use
+  Pydantic models instead of raw `request.json()`.
+- **Benchmark runner retry** distinguishes retryable transients (rate limit,
+  5xx, network, timeout) from permanent errors (auth, validation,
+  missing model) — bad keys fail fast instead of burning 7 minutes per run.
+- **Two sources of truth for version** — `chatbot/api.py` now reads
+  `__version__` from `kb_arena` package metadata.
+
+### Tests
+- Test suite still 558 tests; updated 4 stale tests that asserted old contracts
+  (cost cap default, cross-section edge dropping, health response shape,
+  strategy count).
+
 ## [0.5.0] — 2026-04-26 — Retriever Lab
 
 ### Added

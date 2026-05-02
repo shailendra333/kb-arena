@@ -7,10 +7,11 @@ import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field, field_validator
 from sse_starlette.sse import EventSourceResponse
 
+from kb_arena.chatbot.auth import require_auth
 from kb_arena.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,7 @@ class FixRequest(BaseModel):
     validate_corpus = field_validator("corpus")(_validate_corpus_name)
 
 
-@router.post("/generate")
+@router.post("/generate", dependencies=[Depends(require_auth)])
 async def generate_qa(body: GenerateRequest, request: Request) -> EventSourceResponse:
     """SSE stream Q&A pair generation for a corpus."""
     from kb_arena.generate.qna import generate_pairs_for_section
@@ -118,7 +119,7 @@ async def generate_qa(body: GenerateRequest, request: Request) -> EventSourceRes
     return EventSourceResponse(event_generator())
 
 
-@router.post("/audit")
+@router.post("/audit", dependencies=[Depends(require_auth)])
 async def run_audit_stream(body: AuditRequest, request: Request) -> EventSourceResponse:
     """SSE stream documentation audit."""
     from kb_arena.audit.analyzer import audit_sections_iter
@@ -200,7 +201,7 @@ async def run_audit_stream(body: AuditRequest, request: Request) -> EventSourceR
     return EventSourceResponse(event_generator())
 
 
-@router.post("/fix")
+@router.post("/fix", dependencies=[Depends(require_auth)])
 async def run_fix_stream(body: FixRequest, request: Request) -> EventSourceResponse:
     """SSE stream audit + fix pipeline (two-phase)."""
     from kb_arena.audit.analyzer import AuditReport, SectionAudit, audit_sections_iter

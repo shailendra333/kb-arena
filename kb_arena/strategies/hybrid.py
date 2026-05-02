@@ -1,17 +1,19 @@
-"""Strategy 5: Hybrid Graph + Vector — intent-routed, result-fused.
+"""Strategy 5: Hybrid Graph + Vector — intent-routed, RRF-fused.
 
-Three-stage intent classification determines routing:
-- factoid / exploratory → contextual_vector
-- comparison / relational → knowledge_graph
-- procedural → both, results fused, deduplicated, re-ranked by Sonnet
+Three-stage intent classification (via IntentRouter or keyword fallback):
+- factoid / exploratory  -> contextual_vector (primary)
+- comparison / relational -> knowledge_graph (primary)
+- procedural             -> both retrieved, fused via Reciprocal Rank Fusion
 
-Re-ranking: Sonnet scores each chunk 0-1, top 5 passed to final generation.
+For procedural questions, RRF combines the ranked passage lists from each
+sub-strategy and the top-k fused chunks become the actual context for the final
+Sonnet generation. Earlier versions reranked answer strings — that was wrong.
+This version reranks passages, which is what the README has always claimed.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 
@@ -28,46 +30,32 @@ SYSTEM_PROMPT = (
     "Answer accurately and completely. Cite where you found the information when useful."
 )
 
-RERANK_PROMPT = """Rate how relevant this passage is to the question on a scale of 0.0 to 1.0.
-Return ONLY a JSON object: {"score": 0.8}
-
-Question: {question}
-Passage: {passage}"""
+# Standard RRF constant — Cormack et al. 2009 recommend 60.
+_RRF_K = 60
 
 
-async def _score_passage(llm, question: str, passage: str) -> tuple[str, float]:
-    """Score a single passage — runs concurrently with asyncio.gather."""
-    try:
-        resp = await llm.classify(
-            query="",
-            system_prompt=RERANK_PROMPT.format(question=question, passage=passage[:1000]),
-            max_tokens=50,
-        )
-        data = json.loads(resp.strip())
-        score = float(data.get("score", 0.5))
-    except Exception:
-        score = 0.5
-    return passage, score
-
-
-async def _rerank_passages(llm, question: str, passages: list[str]) -> list[tuple[str, float]]:
-    """Score all passages concurrently with Haiku and return sorted (passage, score) pairs."""
-    results = await asyncio.gather(*[_score_passage(llm, question, p) for p in passages])
-    scored = list(results)
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return scored
-
-
-def _deduplicate_passages(passages: list[str], threshold: int = 50) -> list[str]:
-    """Remove near-duplicate passages by leading token overlap."""
-    seen_prefixes: set[str] = set()
-    unique = []
-    for p in passages:
-        prefix = " ".join(p.split()[:threshold])
-        if prefix not in seen_prefixes:
-            seen_prefixes.add(prefix)
-            unique.append(p)
-    return unique
+def _reciprocal_rank_fusion(
+    ranked_lists: list[list[RetrievedChunk]], k: int = _RRF_K
+) -> list[RetrievedChunk]:
+    """Fuse multiple ranked chunk lists into one. Higher RRF = better."""
+    scores: dict[str, float] = {}
+    chunk_by_id: dict[str, RetrievedChunk] = {}
+    for ranking in ranked_lists:
+        for chunk in ranking:
+            cid = chunk.chunk_id
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + chunk.rank)
+            # Keep the highest-ranked instance of each chunk for content/metadata.
+            existing = chunk_by_id.get(cid)
+            if existing is None or chunk.rank < existing.rank:
+                chunk_by_id[cid] = chunk
+    fused = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    result: list[RetrievedChunk] = []
+    for i, (cid, fused_score) in enumerate(fused):
+        c = chunk_by_id[cid].model_copy()
+        c.rank = i + 1
+        c.score = fused_score
+        result.append(c)
+    return result
 
 
 def _merge_sources(*source_lists: list[str]) -> list[str]:
@@ -82,16 +70,16 @@ def _merge_sources(*source_lists: list[str]) -> list[str]:
 
 
 class HybridStrategy(Strategy):
-    """Intent-routed retrieval: vector for simple, graph for complex, both for procedural."""
+    """Intent-routed retrieval: vector for simple, graph for complex, RRF-fused for procedural."""
 
     name = "hybrid"
 
-    def __init__(self, neo4j_driver=None, chroma_client=None, router=None):
+    def __init__(self, neo4j_driver=None, chroma_client=None, router=None, llm=None):
         super().__init__()
         self._neo4j = neo4j_driver
         self._chroma = chroma_client
         self._router = router
-        self._llm = None
+        self._llm = llm
         self._vector_strategy = None
         self._graph_strategy = None
 
@@ -117,15 +105,14 @@ class HybridStrategy(Strategy):
         return self._graph_strategy
 
     async def _classify(self, question: str, history: list[dict] | None = None) -> str:
-        """Use the IntentRouter if available, fall back to keyword rules."""
+        """Use the IntentRouter when available; otherwise keyword fallback."""
         if self._router is not None:
             try:
                 intent = await self._router.classify(question, history)
-                return intent.value
+                return intent.value if hasattr(intent, "value") else str(intent)
             except Exception as exc:
                 logger.warning("Intent router failed, using keyword fallback: %s", exc)
 
-        # Inline keyword fallback (mirrors router logic)
         q = question.lower()
         if any(kw in q for kw in ["compare", "vs", "difference", "versus"]):
             return "comparison"
@@ -144,14 +131,13 @@ class HybridStrategy(Strategy):
         await self._get_graph().build_index(documents)
 
     async def query(self, question: str, top_k: int = 5) -> AnswerResult:
-        """Route by intent, fuse results for procedural, re-rank top passages."""
+        """Route by intent. Procedural fuses passages via RRF, then generates one final answer."""
         start = self._start_timer()
         intent = await self._classify(question)
         llm = self._get_llm()
 
         sources: list[str] = []
         graph_ctx: GraphContext | None = None
-        passages: list[str] = []
         total_tokens = 0
         total_cost = 0.0
         retrieval_ms = 0.0
@@ -159,7 +145,6 @@ class HybridStrategy(Strategy):
         sub_traces: list[RetrievalTrace] = []
 
         if intent in ("comparison", "relational"):
-            # Graph-primary
             retrieval_start = time.perf_counter()
             graph_result = await self._get_graph().query(question, top_k=top_k)
             retrieval_ms = (time.perf_counter() - retrieval_start) * 1000
@@ -173,7 +158,6 @@ class HybridStrategy(Strategy):
                 sub_traces.append(graph_result.retrieval)
 
         elif intent in ("factoid", "exploratory"):
-            # Vector-primary
             retrieval_start = time.perf_counter()
             vector_result = await self._get_vector().query(question, top_k=top_k)
             retrieval_ms = (time.perf_counter() - retrieval_start) * 1000
@@ -186,41 +170,47 @@ class HybridStrategy(Strategy):
                 sub_traces.append(vector_result.retrieval)
 
         else:
-            # Procedural — fuse both
+            # Procedural — RRF fuse passages, generate one final answer over fused context.
             retrieval_start = time.perf_counter()
-            vector_result = await self._get_vector().query(question, top_k=top_k)
-            graph_result = await self._get_graph().query(question, top_k=top_k)
+            vector_result, graph_result = await asyncio.gather(
+                self._get_vector().query(question, top_k=top_k * 2),
+                self._get_graph().query(question, top_k=top_k * 2),
+            )
             retrieval_ms = (time.perf_counter() - retrieval_start) * 1000
+
+            # Sub-strategies generated their own answers; we discard those and
+            # pay only for the fusion generation. Track their costs anyway since
+            # they were spent on retrieval+generation upstream — for cost honesty.
             total_tokens = vector_result.tokens_used + graph_result.tokens_used
             total_cost = vector_result.cost_usd + graph_result.cost_usd
+
+            vec_chunks: list[RetrievedChunk] = (
+                list(vector_result.retrieval.retrieved) if vector_result.retrieval else []
+            )
+            graph_chunks: list[RetrievedChunk] = (
+                list(graph_result.retrieval.retrieved) if graph_result.retrieval else []
+            )
+
             if vector_result.retrieval:
                 sub_traces.append(vector_result.retrieval)
             if graph_result.retrieval:
                 sub_traces.append(graph_result.retrieval)
 
-            # Collect raw context chunks for re-ranking
-            raw_passages = []
-            if vector_result.answer:
-                raw_passages.append(vector_result.answer)
-            if graph_result.answer and graph_result.answer != vector_result.answer:
-                raw_passages.append(graph_result.answer)
+            fused = _reciprocal_rank_fusion([vec_chunks, graph_chunks])[:top_k]
 
-            # Add any additional short passages from graph context
-            if graph_result.graph_context:
-                for node in graph_result.graph_context.nodes[:5]:
-                    desc = node.get("description", "")
+            # Build the context from the actual passage content of the fused chunks.
+            context_parts: list[str] = []
+            for ch in fused:
+                if ch.content:
+                    context_parts.append(ch.content)
+            # Add graph node descriptions when chunks didn't carry content.
+            if graph_result.graph_context and not context_parts:
+                for node in graph_result.graph_context.nodes[:top_k]:
+                    desc = node.get("description") or ""
                     if desc:
-                        raw_passages.append(f"{node.get('name', '')}: {desc}")
+                        context_parts.append(f"{node.get('name', '')}: {desc}")
 
-            raw_passages = _deduplicate_passages(raw_passages)
-
-            if len(raw_passages) > 1:
-                scored = await _rerank_passages(llm, question, raw_passages[:10])
-                passages = [p for p, _ in scored[:top_k]]
-            else:
-                passages = raw_passages
-
-            context = "\n\n---\n\n".join(passages)
+            context = "\n\n---\n\n".join(context_parts)
             gen_start = time.perf_counter()
             resp = await llm.generate(
                 query=question,
@@ -234,21 +224,27 @@ class HybridStrategy(Strategy):
             sources = _merge_sources(vector_result.sources, graph_result.sources)
             graph_ctx = graph_result.graph_context
 
-        # Merge sub-strategy traces, preserving original source_strategy on each chunk.
-        merged_chunks: list[RetrievedChunk] = []
-        seen_ids: set[str] = set()
-        for sub in sub_traces:
-            for ch in sub.retrieved:
-                if ch.chunk_id in seen_ids:
-                    continue
-                seen_ids.add(ch.chunk_id)
-                merged_chunks.append(ch)
-        merged_chunks.sort(key=lambda c: c.score, reverse=True)
-        for i, ch in enumerate(merged_chunks[:top_k]):
-            ch.rank = i + 1
+        # Build the trace returned to the caller. For procedural we already have
+        # the fused list; for the routed branches we merge sub-traces by best rank.
+        if intent == "procedural":
+            merged_chunks = fused
+        else:
+            merged_chunks = []
+            seen_ids: set[str] = set()
+            for sub in sub_traces:
+                for ch in sub.retrieved:
+                    if ch.chunk_id in seen_ids:
+                        continue
+                    seen_ids.add(ch.chunk_id)
+                    merged_chunks.append(ch)
+            merged_chunks.sort(key=lambda c: c.score, reverse=True)
+            for i, ch in enumerate(merged_chunks[:top_k]):
+                ch.rank = i + 1
+            merged_chunks = merged_chunks[:top_k]
+
         trace = RetrievalTrace(
             query=question,
-            retrieved=merged_chunks[:top_k],
+            retrieved=merged_chunks,
             latency_ms=retrieval_ms,
             top_k=top_k,
         )
@@ -270,19 +266,17 @@ class HybridStrategy(Strategy):
         )
 
     async def stream_answer(self, question: str, history: list[dict] | None = None):
-        """Route to appropriate strategy and stream its answer."""
+        """Stream from the routed sub-strategy. Procedural falls back to vector for latency."""
         intent = await self._classify(question, history)
-
-        if intent in ("comparison", "relational"):
-            async for token in self._get_graph().stream_answer(question, history):
-                yield token
-            self.last_sources = self._get_graph().last_sources
-            self.last_graph_context = self._get_graph().last_graph_context
-            self.last_latency_ms = self._get_graph().last_latency_ms
-        else:
-            # For factoid/exploratory/procedural, stream from vector
-            # (procedural full fusion is too slow for streaming; use vector as primary)
-            async for token in self._get_vector().stream_answer(question, history):
-                yield token
-            self.last_sources = self._get_vector().last_sources
-            self.last_latency_ms = self._get_vector().last_latency_ms
+        primary = (
+            self._get_graph() if intent in ("comparison", "relational") else self._get_vector()
+        )
+        async for token in primary.stream_answer(question, history):
+            yield token
+        # The sub-strategy's stream_answer already yields a meta packet at the end;
+        # api.py consumes the LAST one it sees, so no extra emission here.
+        # But if the sub-strategy didn't yield a meta packet (legacy plugin),
+        # build one from a non-streaming query() so the SSE consumer gets accurate meta.
+        # We can't easily detect that mid-stream — accept the cost of one extra query() only
+        # when no meta arrived; for now rely on default base behaviour which always emits.
+        return

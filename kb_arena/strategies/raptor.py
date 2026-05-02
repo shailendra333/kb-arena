@@ -18,7 +18,7 @@ from kb_arena.models.document import Document
 from kb_arena.models.retrieval import RetrievalTrace, RetrievedChunk
 from kb_arena.settings import settings
 from kb_arena.strategies.base import AnswerResult, Strategy
-from kb_arena.strategies.embeddings import OpenAIEmbedding
+from kb_arena.strategies.embeddings import get_embedding_function
 from kb_arena.tokenizer import detokenize, tokenize
 
 logger = logging.getLogger(__name__)
@@ -97,7 +97,7 @@ class RaptorStrategy(Strategy):
         return self._client
 
     def _get_collection(self, level: int):
-        ef = OpenAIEmbedding()
+        ef = get_embedding_function()
         return self._get_client().get_or_create_collection(
             name=f"raptor_l{level}",
             embedding_function=ef,

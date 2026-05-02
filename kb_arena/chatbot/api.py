@@ -10,27 +10,35 @@ import asyncio as _asyncio
 import importlib.resources as _pkg_resources
 import json
 import logging
-import time
-from collections import defaultdict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path as _Path
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 from sse_starlette.sse import EventSourceResponse
 
+from kb_arena import __version__
 from kb_arena.arena.engine import ArenaEngine
+from kb_arena.chatbot.auth import require_auth
 from kb_arena.chatbot.session import SessionStore
 from kb_arena.chatbot.tools_api import router as tools_router
-from kb_arena.models.api import ChatRequest, ChatResponse, ErrorDetail, ErrorResponse
+from kb_arena.models.api import (
+    ArenaMatchRequest,
+    ArenaVoteRequest,
+    ChatRequest,
+    ChatResponse,
+    ErrorDetail,
+    ErrorResponse,
+)
 from kb_arena.settings import settings
 
-# Per-corpus queues for streaming graph build events to SSE clients
+# Per-build UUID queues for streaming graph build events to SSE clients.
+# Keyed by build_id (not corpus) so concurrent builds for the same corpus don't collide.
 _graph_build_queues: dict[str, _asyncio.Queue] = {}
 
 
@@ -51,24 +59,38 @@ class _GraphBuildRequest(BaseModel):
 
 logger = logging.getLogger(__name__)
 
-# Simple in-memory rate limiter (requests per minute per IP)
-_rate_store: dict[str, list[float]] = defaultdict(list)
-RATE_LIMIT_RPM = 60
-
 # Per-session memory for multi-turn conversations (TTL-based eviction)
 _session_store = SessionStore(ttl_minutes=settings.session_ttl_minutes)
 
+# Back-compat re-exports for tests that imported the old rate-limiter store
+# directly. The active store now lives in kb_arena.chatbot.auth.
+from kb_arena.chatbot import auth as _auth_module  # noqa: E402
+
+_rate_store = _auth_module._rate_store
+RATE_LIMIT_RPM = _auth_module.RATE_LIMIT_RPM
+
 
 def _check_rate_limit(client_ip: str) -> bool:
-    """Returns True if request is allowed, False if rate limited."""
-    now = time.time()
+    """Back-compat shim — old tests called this directly. Returns True if allowed.
+
+    Tolerates plain-list assignment (`_rate_store[ip] = [...]`) used by older
+    audit tests, even though the production store is a deque.
+    """
+    import time as _time
+    from collections import deque
+
+    now = _time.time()
     window = 60.0
-    calls = _rate_store[client_ip]
-    # Evict calls outside the window
-    _rate_store[client_ip] = [t for t in calls if now - t < window]
-    if len(_rate_store[client_ip]) >= RATE_LIMIT_RPM:
+    bucket = _rate_store[client_ip]
+    if not isinstance(bucket, deque):
+        # Convert legacy list assignment to deque so popleft works.
+        bucket = deque(bucket, maxlen=RATE_LIMIT_RPM)
+        _rate_store[client_ip] = bucket
+    while bucket and now - bucket[0] >= window:
+        bucket.popleft()
+    if len(bucket) >= RATE_LIMIT_RPM:
         return False
-    _rate_store[client_ip].append(now)
+    bucket.append(now)
     return True
 
 
@@ -85,17 +107,47 @@ async def lifespan(app: FastAPI):
     from kb_arena.strategies.pageindex import PageIndexStrategy
     from kb_arena.strategies.qna_pairs import QnAPairStrategy
     from kb_arena.strategies.raptor import RaptorStrategy
+    from kb_arena.strategies.rerank_vector import RerankVectorStrategy
 
-    # LLM client (shared across strategies)
-    llm = LLMClient()
+    # Detect zero-config demo: if no API keys are configured AND we're not on Ollama,
+    # auto-enable demo_mode so /chat etc. return 503 instead of crashing on the
+    # first request. The static dashboard, /api/benchmark/results, /api/corpora,
+    # and the public arena/leaderboard read-only endpoints all keep working.
+    has_anthropic = bool(settings.anthropic_api_key)
+    has_openai = bool(settings.openai_api_key)
+    is_ollama = settings.llm_provider == "ollama"
+    if not (has_anthropic or has_openai or is_ollama):
+        if not settings.demo_mode:
+            logger.info(
+                "No API key configured — auto-enabling KB_ARENA_DEMO_MODE. "
+                "Static benchmark/leaderboard pages remain available; "
+                "chat/arena/tools endpoints return 503 until a key is set."
+            )
+            settings.demo_mode = True
+
+    # LLM client (shared across strategies). Tolerate missing keys in demo mode
+    # so the dashboard still loads.
+    llm: LLMClient | None
+    try:
+        llm = LLMClient()
+    except Exception as exc:  # noqa: BLE001 — failure must not stop the demo
+        logger.warning(
+            "LLMClient init failed (%s) — running in demo mode. "
+            "Set KB_ARENA_ANTHROPIC_API_KEY or KB_ARENA_OPENAI_API_KEY to enable chat.",
+            exc,
+        )
+        llm = None
+        settings.demo_mode = True
     app.state.llm = llm
 
     # Neo4j — fail gracefully (Pattern 15: mock fallback)
     app.state.neo4j = None
+    app.state.neo4j_error = ""
     try:
         import neo4j
     except ImportError:
         logger.warning("Neo4j driver not installed — graph strategy will use mock data")
+        app.state.neo4j_error = "neo4j driver not installed"
         neo4j = None  # type: ignore[assignment]
 
     if neo4j is not None:
@@ -108,7 +160,13 @@ async def lifespan(app: FastAPI):
             app.state.neo4j = driver
             logger.info("Neo4j connected at %s", settings.neo4j_uri)
         except (OSError, neo4j.exceptions.ServiceUnavailable) as exc:
-            logger.warning("Neo4j not available (%s) — graph strategy will use mock data", exc)
+            app.state.neo4j_error = str(exc)
+            logger.warning(
+                "Neo4j not available at %s (%s) — knowledge_graph and hybrid will use mock data."
+                " Run: docker compose up neo4j -d",
+                settings.neo4j_uri,
+                exc,
+            )
 
     # ChromaDB (always available — local file)
     import chromadb
@@ -116,8 +174,8 @@ async def lifespan(app: FastAPI):
     chroma = chromadb.PersistentClient(path=settings.chroma_path)
     app.state.chroma = chroma
 
-    # Intent router
-    router = IntentRouter(llm=llm)
+    # Intent router (skipped when LLM is missing — hybrid then falls back to keyword rules)
+    router = IntentRouter(llm=llm) if llm is not None else None
     app.state.router = router
 
     # Strategy map (Pattern 11)
@@ -130,10 +188,12 @@ async def lifespan(app: FastAPI):
             neo4j_driver=app.state.neo4j,
             chroma_client=chroma,
             router=router,
+            llm=llm,
         ),
         "raptor": RaptorStrategy(chroma_client=chroma),
         "pageindex": PageIndexStrategy(),
         "bm25": BM25Strategy(),
+        "rerank_vector": RerankVectorStrategy(chroma_client=chroma, llm_client=llm),
     }
 
     # Arena engine
@@ -162,7 +222,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="KB Arena API",
     description="Benchmark retrieval strategies on your documentation.",
-    version="0.5.0",
+    version=__version__,
     lifespan=lifespan,
 )
 
@@ -209,16 +269,13 @@ def _resolve_strategy(strategy_name: str, request: Request):
     return strategies[strategy_name]
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat", response_model=ChatResponse, dependencies=[Depends(require_auth)])
 async def chat(body: ChatRequest, request: Request) -> ChatResponse:
     """Non-streaming answer from the requested strategy."""
-    client_ip = request.client.host if request.client else "unknown"
-    if not _check_rate_limit(client_ip):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
-
     strategy = _resolve_strategy(body.strategy, request)
 
     # Track conversation history per session (X-Session-ID header preferred, IP fallback)
+    client_ip = request.client.host if request.client else "unknown"
     session_id = request.headers.get("x-session-id", client_ip)
     session_key = f"{session_id}:{body.strategy}"
     session = _session_store.get(session_key)
@@ -239,16 +296,16 @@ async def chat(body: ChatRequest, request: Request) -> ChatResponse:
     )
 
 
-@app.post("/chat/stream")
+@app.post("/chat/stream", dependencies=[Depends(require_auth)])
 async def chat_stream(body: ChatRequest, request: Request) -> EventSourceResponse:
     """SSE streaming with 4 event types (Pattern 10 from PLAN.md).
 
     Events: message_id → token* → done (sources + graph_context) → meta (timing)
-    """
-    client_ip = request.client.host if request.client else "unknown"
-    if not _check_rate_limit(client_ip):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
+    The done/meta payloads come from the per-call `RetrievalTrace` and metrics that
+    `stream_answer` records on the result side, not from shared instance state — see
+    Strategy.stream_answer for the per-call snapshot.
+    """
     strategy = _resolve_strategy(body.strategy, request)
     history = [{"role": m.role, "content": m.content} for m in body.history]
 
@@ -256,8 +313,13 @@ async def chat_stream(body: ChatRequest, request: Request) -> EventSourceRespons
         msg_id = str(uuid4())
         yield {"event": "message_id", "data": json.dumps({"id": msg_id})}
 
+        snapshot: dict | None = None
         try:
             async for token in strategy.stream_answer(body.query, history):
+                if isinstance(token, dict) and "_kb_arena_meta" in token:
+                    # Final meta packet — see Strategy.stream_answer protocol.
+                    snapshot = token["_kb_arena_meta"]
+                    continue
                 yield {"event": "token", "data": json.dumps({"text": token})}
         except Exception as exc:
             yield {
@@ -266,13 +328,17 @@ async def chat_stream(body: ChatRequest, request: Request) -> EventSourceRespons
             }
             return
 
-        graph_ctx = strategy.last_graph_context
+        # Snapshot is per-call (no shared state). Falls back to "" / 0 if the
+        # strategy didn't emit one (kept for backward compat with any external plugins).
+        snapshot = snapshot or {}
+        sources = snapshot.get("sources", [])
+        graph_ctx = snapshot.get("graph_context")
         yield {
             "event": "done",
             "data": json.dumps(
                 {
-                    "sources": strategy.last_sources,
-                    "graph_context": graph_ctx.model_dump() if graph_ctx else None,
+                    "sources": sources,
+                    "graph_context": graph_ctx,
                     "strategy_used": strategy.name,
                 }
             ),
@@ -282,9 +348,9 @@ async def chat_stream(body: ChatRequest, request: Request) -> EventSourceRespons
             "event": "meta",
             "data": json.dumps(
                 {
-                    "latency_ms": strategy.last_latency_ms,
-                    "tokens_used": strategy.last_tokens_used,
-                    "cost_usd": strategy.last_cost_usd,
+                    "latency_ms": snapshot.get("latency_ms", 0.0),
+                    "tokens_used": snapshot.get("tokens_used", 0),
+                    "cost_usd": snapshot.get("cost_usd", 0.0),
                 }
             ),
         }
@@ -538,9 +604,12 @@ async def graph_data(request: Request, corpus: str = "all", limit: int = 200) ->
     return {"nodes": nodes, "edges": edges, "connected": True}
 
 
-@app.post("/api/graph/build")
+@app.post("/api/graph/build", dependencies=[Depends(require_auth)])
 async def trigger_graph_build(body: _GraphBuildRequest) -> dict:
-    """Trigger graph build for a corpus. Events streamed via /api/graph/build/stream/{corpus}."""
+    """Trigger graph build for a corpus.
+
+    Returns a unique build_id; stream via /api/graph/build/stream/{build_id}.
+    """
     corpus = body.corpus
 
     # Validate corpus exists and has processed documents
@@ -557,8 +626,9 @@ async def trigger_graph_build(body: _GraphBuildRequest) -> dict:
             detail=f"Corpus '{corpus}' has no processed documents. Run 'kb-arena ingest' first.",
         )
 
+    build_id = str(uuid4())
     queue: _asyncio.Queue = _asyncio.Queue()
-    _graph_build_queues[corpus] = queue
+    _graph_build_queues[build_id] = queue
 
     async def _callback(event: dict | None) -> None:
         await queue.put(event)
@@ -573,22 +643,22 @@ async def trigger_graph_build(body: _GraphBuildRequest) -> dict:
         finally:
             await queue.put(None)  # sentinel — signals stream end
 
-    _asyncio.create_task(_run())
-    return {"status": "started", "corpus": corpus}
+    _asyncio.create_task(_run(), name=f"graph_build:{build_id}")
+    return {"status": "started", "build_id": build_id, "corpus": corpus}
 
 
-@app.get("/api/graph/build/stream/{corpus}")
-async def graph_build_stream(corpus: str) -> EventSourceResponse:
-    """SSE stream of graph build events for a corpus."""
-    queue = _graph_build_queues.get(corpus)
+@app.get("/api/graph/build/stream/{build_id}")
+async def graph_build_stream(build_id: str) -> EventSourceResponse:
+    """SSE stream of graph build events for a specific build."""
+    queue = _graph_build_queues.get(build_id)
     if queue is None:
 
         async def _empty() -> AsyncIterator[dict]:
+            # 410 Gone semantics: tell EventSource clients to stop reconnecting.
             yield {
                 "event": "error",
-                "data": json.dumps(
-                    {"message": "No build in progress. POST to /api/graph/build first."}
-                ),
+                "retry": 99999999,
+                "data": json.dumps({"message": "Build not found. POST to /api/graph/build first."}),
             }
 
         return EventSourceResponse(_empty())
@@ -603,27 +673,21 @@ async def graph_build_stream(corpus: str) -> EventSourceResponse:
             if event is None:  # sentinel — build complete
                 break
             yield {"event": event["type"], "data": json.dumps(event["data"])}
-        _graph_build_queues.pop(corpus, None)
+        _graph_build_queues.pop(build_id, None)
 
     return EventSourceResponse(event_generator())
 
 
-@app.post("/api/arena/match")
-async def arena_create_match(request: Request):
+@app.post("/api/arena/match", dependencies=[Depends(require_auth)])
+async def arena_create_match(body: ArenaMatchRequest, request: Request):
     """Create a blind A/B match between two random strategies."""
     arena = request.app.state.arena
     if not arena:
         return JSONResponse(
             {"error": {"code": "arena_unavailable", "message": "Arena not initialized"}}, 503
         )
-    body = await request.json()
-    question = body.get("question", "").strip()
-    if not question:
-        return JSONResponse(
-            {"error": {"code": "missing_question", "message": "Question required"}}, 400
-        )
     try:
-        match = await arena.create_match(question)
+        match = await arena.create_match(body.question)
         return {
             "match_id": match.id,
             "question": match.question,
@@ -638,18 +702,15 @@ async def arena_create_match(request: Request):
         return JSONResponse({"error": {"code": "match_failed", "message": str(exc)}}, 500)
 
 
-@app.post("/api/arena/vote")
-async def arena_vote(request: Request):
+@app.post("/api/arena/vote", dependencies=[Depends(require_auth)])
+async def arena_vote(body: ArenaVoteRequest, request: Request):
     """Vote on an arena match. Body: {match_id, winner: 'a'|'b'|'tie'}."""
     arena = request.app.state.arena
     if not arena:
         return JSONResponse(
             {"error": {"code": "arena_unavailable", "message": "Arena not initialized"}}, 503
         )
-    body = await request.json()
-    match_id = body.get("match_id", "")
-    winner = body.get("winner", "")
-    result = arena.vote(match_id, winner)
+    result = arena.vote(body.match_id, body.winner)
     if "error" in result:
         return JSONResponse({"error": {"code": "vote_failed", "message": result["error"]}}, 400)
     return result
@@ -667,14 +728,137 @@ async def arena_leaderboard(request: Request):
     }
 
 
+@app.get("/api/leaderboard")
+async def leaderboard(request: Request, corpus: str = "all") -> dict:
+    """Public read-only leaderboard of all benchmark runs across all corpora.
+
+    Aggregates `results/run_*` JSON files into a per-(corpus, strategy) leaderboard
+    with mean accuracy, mean Recall@5, mean NDCG@5, mean cost, and run count.
+    No auth — this is what the hosted demo at kb-arena.dev shows.
+    """
+    import json
+    from collections import defaultdict
+    from pathlib import Path
+
+    base = _Path(settings.results_path)
+    if not base.exists():
+        return {"corpora": [], "leaderboard": []}
+
+    # Collect (corpus, strategy) -> list[per-run metrics]
+    rows: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    seen_corpora: set[str] = set()
+
+    # Top-level files (legacy single-run shape)
+    for path in sorted(base.glob("*.json")):
+        if path.name == "arena_state.json":
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        c = data.get("corpus") or path.stem.split("_")[0]
+        s = data.get("strategy") or path.stem.split("_", 1)[-1]
+        if not c or not s:
+            continue
+        seen_corpora.add(c)
+        if corpus != "all" and c != corpus:
+            continue
+        rows[(c, s)].append(_summarise_run(data))
+
+    # New per-run subdirectories (results/run_<id>/<corpus>_<strategy>.json)
+    for run_dir in sorted(base.glob("run_*")):
+        for path in sorted(Path(run_dir).glob("*.json")):
+            if path.name in {"retriever_lab.json", "report.md"}:
+                continue
+            try:
+                data = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            c = data.get("corpus") or path.stem.split("_")[0]
+            s = data.get("strategy") or path.stem.split("_", 1)[-1]
+            seen_corpora.add(c)
+            if corpus != "all" and c != corpus:
+                continue
+            rows[(c, s)].append(_summarise_run(data))
+
+    leaderboard: list[dict] = []
+    for (c, s), runs in sorted(rows.items()):
+        if not runs:
+            continue
+        leaderboard.append(
+            {
+                "corpus": c,
+                "strategy": s,
+                "runs": len(runs),
+                "mean_accuracy": _avg(runs, "overall_accuracy"),
+                "mean_recall_at_5": _avg(runs, "mean_recall_at_k"),
+                "mean_ndcg_at_5": _avg(runs, "mean_ndcg_at_k"),
+                "mean_cost_usd": _avg(runs, "total_cost_usd"),
+                "mean_latency_ms": _avg(runs, "mean_latency_ms"),
+            }
+        )
+
+    leaderboard.sort(key=lambda r: (r["corpus"], -(r["mean_accuracy"] or 0.0), r["strategy"]))
+
+    return {
+        "corpora": sorted(seen_corpora),
+        "leaderboard": leaderboard,
+        "filter": corpus,
+    }
+
+
+def _summarise_run(data: dict) -> dict:
+    """Pull the leaderboard-relevant fields out of a benchmark JSON, tolerantly."""
+    overall = data.get("overall_accuracy")
+    if overall is None:
+        # Older shape: derive from records.
+        records = data.get("records", [])
+        if records:
+            overall = sum(r.get("score", {}).get("accuracy", 0.0) for r in records) / len(records)
+    cost = data.get("total_cost_usd") or sum(
+        r.get("cost_usd", 0.0) for r in data.get("records", [])
+    )
+    latencies = [r.get("latency_ms", 0.0) for r in data.get("records", [])]
+    mean_latency = sum(latencies) / len(latencies) if latencies else 0.0
+    return {
+        "overall_accuracy": float(overall or 0.0),
+        "mean_recall_at_k": float(data.get("mean_recall_at_k") or 0.0),
+        "mean_ndcg_at_k": float(data.get("mean_ndcg_at_k") or 0.0),
+        "total_cost_usd": float(cost or 0.0),
+        "mean_latency_ms": float(mean_latency),
+    }
+
+
+def _avg(items: list[dict], key: str) -> float | None:
+    values = [it.get(key) for it in items if it.get(key) is not None]
+    if not values:
+        return None
+    return round(sum(values) / len(values), 4)
+
+
 @app.get("/health")
 async def health(request: Request) -> dict:
-    """Health check — reports Neo4j connectivity status."""
+    """Health check — structured fields suitable for k8s-style probes and dashboards."""
     neo4j_ok = request.app.state.neo4j is not None
+    neo4j_error = getattr(request.app.state, "neo4j_error", "")
     return {
         "status": "ok",
-        "neo4j": "connected" if neo4j_ok else "unavailable (mock mode)",
+        "version": __version__,
+        "neo4j": {
+            "connected": neo4j_ok,
+            "uri": settings.neo4j_uri if neo4j_ok else None,
+            "last_error": neo4j_error or None,
+        },
+        "llm": {
+            "provider": settings.llm_provider,
+            "configured": bool(
+                settings.anthropic_api_key
+                or settings.openai_api_key
+                or settings.llm_provider == "ollama"
+            ),
+        },
         "strategies": list(request.app.state.strategies.keys()),
+        "demo_mode": settings.demo_mode,
     }
 
 
@@ -720,12 +904,16 @@ async def readiness(request: Request) -> JSONResponse:
     )
 
 
-@app.post("/api/debug/explain")
+@app.post("/api/debug/explain", dependencies=[Depends(require_auth)])
 async def debug_explain(body: ChatRequest, request: Request) -> dict:
     """Debug endpoint: show intent classification, retrieval chunks, and routing decision.
 
     Returns the full pipeline trace without generating a final answer.
+    Gated behind KB_ARENA_DEBUG=true to avoid exposing internals in production.
     """
+    if not settings.debug:
+        raise HTTPException(status_code=404, detail="not_found")
+
     strategies = request.app.state.strategies
     router = request.app.state.router
 
