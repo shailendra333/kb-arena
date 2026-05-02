@@ -3,7 +3,7 @@
 > **Should you use Graph RAG, Vector RAG, or Hybrid?**
 > KB Arena tells you — empirically, on your own docs.
 
-Eight retrieval architectures. Your documentation. One winner.
+Nine retrieval architectures. Your documentation. One winner.
 
 KB Arena is the only open-source benchmark that runs **architecturally distinct** retrieval strategies — naive vector, contextual vector, Q&A pairs, knowledge graph, hybrid (RRF-fused), RAPTOR, PageIndex, BM25, and **rerank-vector** (cross-encoder reranking) — head-to-head on your own corpus, with auto-generated questions across 5 difficulty tiers, IR metrics (Recall@k, MRR, NDCG@k), RAGAS metrics, ELO arena voting, a CI gate, and a strategy plugin system.
 
@@ -47,7 +47,7 @@ Most RAG evaluation tools answer "how well does my pipeline work?" KB Arena answ
 
 | | KB Arena | RAGAS | MTEB / BEIR | GraphRAG | DeepEval |
 |---|---|---|---|---|---|
-| Compares multiple architectures | Yes - 8 strategies | No - evaluates your existing pipeline | No - compares embedding models | No - only their own approach | No |
+| Compares multiple architectures | Yes - 9 strategies | No - evaluates your existing pipeline | No - compares embedding models | No - only their own approach | No |
 | Works on your own docs | Yes | Yes | No - fixed public datasets | No - fixed datasets | Yes |
 | Includes graph + vector + hybrid | Yes | Vector/hybrid only | Embeddings only | Graph only | Any |
 | Auto-generates benchmark questions | Yes - 5 difficulty tiers | Manual | Fixed | Fixed | Manual |
@@ -56,6 +56,97 @@ Most RAG evaluation tools answer "how well does my pipeline work?" KB Arena answ
 | Standard IR metrics (NDCG, MRR) | Yes - v0.5.0 Retriever Lab | Yes | Yes | Partial | No |
 
 If you want to know whether a knowledge graph, Q&A pairs, or plain vector search is the right architecture for your documentation, that's what KB Arena is for.
+
+---
+
+## What's New in v0.6.0 — Hardening, 9th strategy, embedding providers, public leaderboard
+
+A focused release that closes the four ship-blocker classes from a multi-dimension audit and adds three differentiated capabilities. Headline numbers in the README are now backed by code that does what it says.
+
+### New: 9th strategy — `rerank_vector`
+
+Naive Vector retrieval at top-`k`×4, rescored by a cross-encoder, regenerated on the post-rerank top-k. Three backends, all selected via `KB_ARENA_RERANKER_BACKEND`:
+
+- `bge` — BAAI/bge-reranker-v2-m3, **local, free, no key**, default
+- `cohere` — Cohere Rerank v3.5 / v4
+- `voyage` — Voyage Rerank 2.5
+
+The 2026 RAG consensus is that a reranker is the highest-leverage production accuracy lever. KB Arena now lets you benchmark every architecture *with and without* one, on your own corpus.
+
+### New: embedding provider abstraction
+
+`KB_ARENA_EMBEDDING_PROVIDER` selects the embedding backend used by every vector strategy:
+
+| Provider | Why pick it |
+|---|---|
+| `openai` (default) | text-embedding-3-large |
+| `voyage` | Current MTEB retrieval leader (+10.58% over OpenAI at matched dims) |
+| `cohere` | Cohere embed-v4 |
+| `bge` | BAAI/bge-large-en-v1.5 — **local, no key**, on-prem-friendly |
+| `ollama` | Local via Ollama, no key |
+| `gemini` | text-embedding-004 |
+
+Unblocks privacy / on-prem teams (federal, healthcare, finance) and Gemini-shop / Bedrock-shop deployments.
+
+### New: `kb-arena run --resume`
+
+Replaces the seven-step pipeline with one resumable command. Each stage writes a checkpoint to `datasets/{corpus}/.pipeline_state.json`; a flaky LLM call no longer means starting over.
+
+```bash
+kb-arena run --corpus my-docs --docs ~/my-docs/   # one shot
+kb-arena run --corpus my-docs --resume            # pick up where it stopped
+```
+
+### New: public leaderboard
+
+`/api/leaderboard` aggregates every benchmark run in `results/run_*` per (corpus, strategy) with mean accuracy, Recall@5, NDCG@5, cost, and latency. Plus a Next.js `/leaderboard` page that consumes it. **No auth** — safe for hosted deploys; the static dashboard, leaderboard, benchmark results, and corpora endpoints stay available even when chat is locked down.
+
+### Hardened: never drains your credits
+
+The hosted-demo cost-bomb path is closed. New defaults:
+
+- `KB_ARENA_API_TOKEN` — when set, every LLM endpoint requires `Authorization: Bearer …` (constant-time compared)
+- `KB_ARENA_DEMO_MODE` — auto-enabled when no API key is configured; chat / arena / tools return 503 while the static surfaces keep working
+- `Field(max_length=4000)` on every user input + Pydantic models for the arena endpoints
+- Default `KB_ARENA_BENCHMARK_COST_CAP_USD` flipped from 0 (unlimited) to **10.0**
+- Bounded-deque rate limiter, optional `KB_ARENA_TRUSTED_PROXY_HEADER` for nginx / Cloudflare deployments
+
+### Hardened: Cypher safety + SSRF
+
+- Every Neo4j read path now opens a session with `default_access_mode=READ_ACCESS` — defense in depth at the Bolt protocol level
+- Write regex tightened to also reject `apoc.create | merge | refactor | delete | remove | set | drop | iterate | cypher.runWrite | export | trigger`
+- `kb-arena ingest <url>` rejects `file://`, private/loopback/link-local IPs (post-DNS), and AWS / GCE metadata hostnames; auto-redirect off, per-hop validation
+- Dockerfile non-root user, HEALTHCHECK, `KB_ARENA_DEMO_MODE=true` baked in so a freshly built image cannot accidentally enable chat
+
+### Fixed: Hybrid actually fuses passages, not answers
+
+The procedural branch used to rerank already-generated answer strings — that explained the embarrassing 8% Recall@5 in the v0.5.0 table. v0.6.0 retrieves real `RetrievedChunk` content from each sub-strategy at top-`k`×2, fuses with **Reciprocal Rank Fusion (k=60)** (which the README has always claimed), regenerates over the fused context, and runs the vector + graph queries with `asyncio.gather`. IntentRouter is now wired into `get_strategy("hybrid")` so the advertised three-stage classification actually fires.
+
+### Fixed: cross-section graph edges
+
+Knowledge-graph extraction used to drop every relationship pointing outside its section's batch — multi-hop queries were structurally impossible. v0.6.0 keeps cross-section edges and validates them against the global FQN union *after* every section has been extracted, restoring multi-hop reasoning.
+
+### Fixed: ground-truth labelling no longer circular
+
+`expected_chunks.yaml` candidates are now drawn from the union of BM25, naive vector, and contextual vector top-N (when those indexes exist). The previous BM25-only pool biased Recall@5 in favour of keyword-overlap strategies — closes the methodological critique.
+
+### Fixed: cross-tenant data leak
+
+Strategy `last_*` instance fields were stomped by concurrent SSE consumers — two simultaneous chat requests could see each other's sources. Per-call metrics now ride the streamed token sequence as a `_kb_arena_meta` packet; the legacy fields stay only for plugin back-compat.
+
+### Demo polish
+
+- `kb-arena demo` truly zero-config — `LLMClient` init is tolerant of missing keys, `demo_mode` auto-enables, dashboard loads instantly
+- `aws-compute_bm25.json` is bundled (was missing in v0.5.0 — the 8th strategy showed empty in fresh installs)
+- README hero rewritten with the question-frame pitch, plus a No-API-Keys Quick Start using Ollama
+- Re-recorded hero GIF + UI walkthrough GIF + retriever-lab CLI GIF, all driven by checked-in `vhs` tape scripts in `docs/tapes/`
+- `kb-arena --version` flag
+
+### Roadmap (Phase 3 — prepped, not yet published)
+
+- Public Arena Mode with ELO at `kb-arena.dev/arena` — "Chatbot Arena, but for RAG architectures"
+- Hosted demo at `kb-arena.dev` (Vercel + fly.io configs in `deploy/`)
+- BEIR / MTEB native dataset adapter, ColBERTv2 strategy via RAGatouille, Self-RAG / CRAG agentic strategies, OpenTelemetry tracing
 
 ---
 
@@ -305,6 +396,7 @@ kb-arena report --format html   # shareable dashboard
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 0.6.0 | 2026-05-02 | Hardening + 9th strategy + embedding providers + public leaderboard. New `rerank_vector` strategy with BGE/Cohere/Voyage backends. Embedding provider abstraction (OpenAI/Voyage/Cohere/BGE/Ollama/Gemini). One-shot `kb-arena run --resume` orchestrator. Public read-only `/api/leaderboard` + `/leaderboard` page. Bearer-token auth + demo-mode + 4000-char input cap on every LLM endpoint. Default cost cap 0 → 10 USD. Cypher sessions opened READ_ACCESS, APOC write regex tightened. WebParser SSRF guard. Hybrid procedural rewritten to fuse real passages via RRF (was reranking answer strings). IntentRouter actually wired in. Cross-section graph edges no longer dropped. Ground-truth pool widened from BM25-only. Cross-tenant strategy state leak fixed. BM25 result file bundled. Re-recorded demo GIFs. 558 tests. |
 | 0.5.0 | 2026-04-26 | Retriever Lab — classical IR metrics (Recall@k, Precision@k, Hit@k, MRR, NDCG@k) computed per query, `RetrievalTrace` exposes retrieved chunks per strategy with rank+score, `kb-arena retriever-lab` retrieval-only command (~10x cheaper than `benchmark`), `kb-arena label-chunks` BM25+Haiku ground-truth generator, `--top-k` flag on `benchmark`, `/retriever-lab` web page with HIT/MISS drill-down, hierarchical chunk-id matching, 558 tests |
 | 0.4.0 | 2026-04-04 | RAGAS metrics (faithfulness, context precision/recall, answer relevancy), reference-free eval mode, LLM eval memoization, cost cap enforcement, strategy plugin system (`--strategy-module`), CI/CD eval command (`kb-arena eval --ci`), debug/explain endpoint, `/ready` health probe, exponential backoff on retries, embedding API retry+timeout, arena ELO JSONL persistence, side-by-side strategy comparison UI, benchmark dry-run cost estimates, tightened corpus validation |
 | 0.3.1 | 2026-03-26 | Production hardening (session IDs, TTL, CORS config, corpus validation), streaming cost for OpenAI/Ollama, parallel QnA build, custom exceptions, error boundary, graph schema cleanup, 494 tests |
@@ -405,7 +497,7 @@ kb-arena build-vectors --corpus my-docs
 # Auto-generate benchmark questions from your docs (10 per difficulty tier)
 kb-arena generate-questions --corpus my-docs --count 50
 
-# Run the benchmark (each question x 8 strategies, 4-pass evaluation)
+# Run the benchmark (each question x 9 strategies, 4-pass evaluation)
 kb-arena benchmark --corpus my-docs
 
 # Launch the web UI to explore results
@@ -464,11 +556,11 @@ kb-arena serve
 
 ## Screenshots
 
-**Home** — Overview of the 8 strategies, difficulty tiers, and evaluation methodology.
+**Home** — Overview of the 9 strategies, difficulty tiers, and evaluation methodology.
 
 ![Home page](docs/screenshot-home.png)
 
-**Strategy comparison** — Ask the same question to all 8 strategies simultaneously. Compare answers, sources, latency, and cost side-by-side.
+**Strategy comparison** — Ask the same question to all 9 strategies simultaneously. Compare answers, sources, latency, and cost side-by-side.
 
 ![Strategy comparison demo](docs/screenshot-demo.png)
 
@@ -566,7 +658,7 @@ These are results from the built-in AWS Compute corpus. Your mileage will vary �
 
 ---
 
-## The 8 Strategies
+## The 9 Strategies
 
 | # | Strategy | How it works | Best at |
 |---|----------|-------------|---------|
@@ -574,10 +666,11 @@ These are results from the built-in AWS Compute corpus. Your mileage will vary �
 | 2 | **Contextual Vector** | Chunk + parent context → embed → rank | Disambiguating domain-specific terms |
 | 3 | **Q&A Pairs** | LLM pre-generates Q&A at index time → match | Common questions with known answers |
 | 4 | **Knowledge Graph** | Entities → Neo4j → Cypher templates → generate | Multi-hop dependencies, cross-topic queries |
-| 5 | **Hybrid** | Intent routing → vector or graph or both (RRF) | Adapts per question type |
+| 5 | **Hybrid** | Intent routing → vector + graph fused via RRF | Adapts per question type |
 | 6 | **RAPTOR** | Cluster chunks → LLM topic summaries → recursive tree → query all levels | Cross-document synthesis, broad topic questions |
 | 7 | **PageIndex** | Build tree index from doc structure → LLM beam search traversal → no vectors | Well-structured docs, reasoning over hierarchy |
 | 8 | **BM25** | Classic keyword matching (BM25Okapi) → LLM generation | Pre-neural baseline — "do I even need embeddings?" |
+| 9 | **Rerank Vector** | Naive Vector at top-k×4 → cross-encoder rerank (BGE / Cohere / Voyage) → top-k → generate | The 2026 reranker question: "is the upgrade worth it on my docs?" |
 
 ---
 
