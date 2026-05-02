@@ -43,6 +43,8 @@ def _make_mock_strategy(
 @pytest.fixture
 def app_client():
     from kb_arena.chatbot.api import _rate_store, app
+    from kb_arena.chatbot.auth import require_auth
+    from kb_arena.settings import settings
 
     strategies = {
         "naive_vector": _make_mock_strategy("naive_vector", "Naive vector answer"),
@@ -54,10 +56,23 @@ def app_client():
 
     _rate_store.clear()
 
-    with TestClient(app, raise_server_exceptions=False) as client:
-        app.state.strategies = strategies
-        app.state.neo4j = None
-        yield client
+    # CI runs without API keys, which makes the lifespan auto-enable demo_mode
+    # and the require_auth dependency return 503 on every /chat call. The
+    # integration tests model the behaviour of a fully-configured deployment,
+    # so we (a) override auth to a no-op, (b) force demo_mode off for the
+    # duration of the test session.
+    prior_demo_mode = settings.demo_mode
+    settings.demo_mode = False
+    app.dependency_overrides[require_auth] = lambda: None
+
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            app.state.strategies = strategies
+            app.state.neo4j = None
+            yield client
+    finally:
+        app.dependency_overrides.pop(require_auth, None)
+        settings.demo_mode = prior_demo_mode
 
 
 # ---------------------------------------------------------------------------

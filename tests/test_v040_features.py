@@ -244,7 +244,9 @@ class TestDebugEndpoint:
 
 
 class TestAPIVersion:
-    def test_api_version_050(self):
+    def test_api_version_matches_package(self):
+        # Single source of truth: FastAPI metadata mirrors importlib.metadata.
+        from kb_arena import __version__
         from kb_arena.chatbot.api import app
 
-        assert app.version == "0.5.0"
+        assert app.version == __version__

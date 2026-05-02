@@ -62,6 +62,8 @@ def _make_graph_strategy(name: str = "knowledge_graph") -> MagicMock:
 @pytest.fixture
 def client():
     from kb_arena.chatbot.api import app
+    from kb_arena.chatbot.auth import require_auth
+    from kb_arena.settings import settings
 
     strategies = {
         "naive_vector": _make_strategy("naive_vector", "Naive vector answer about json."),
@@ -71,10 +73,21 @@ def client():
         "hybrid": _make_strategy("hybrid", "Hybrid routing answer."),
     }
 
-    with TestClient(app, raise_server_exceptions=False) as c:
-        app.state.strategies = strategies
-        app.state.neo4j = None
-        yield c
+    # The integration tests model a fully-configured deployment; CI runs
+    # without API keys, which auto-enables demo_mode. Force it off and
+    # short-circuit the auth dependency for the duration of the test.
+    prior_demo_mode = settings.demo_mode
+    settings.demo_mode = False
+    app.dependency_overrides[require_auth] = lambda: None
+
+    try:
+        with TestClient(app, raise_server_exceptions=False) as c:
+            app.state.strategies = strategies
+            app.state.neo4j = None
+            yield c
+    finally:
+        app.dependency_overrides.pop(require_auth, None)
+        settings.demo_mode = prior_demo_mode
 
 
 @pytest.fixture
