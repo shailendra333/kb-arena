@@ -2,6 +2,15 @@
 
 All notable changes to KB Arena.
 
+## [0.6.1] — 2026-05-02 — Docs
+
+### Changed
+- README gains a full "What's New in v0.6.0" section (was missing from the
+  v0.6.0 PyPI listing because PyPI doesn't allow republishing the same version).
+- Strategy count bumped from 8 to 9 across the README; the strategy table now
+  lists the new `rerank_vector` row; changelog table gains a v0.6.0 entry.
+- No code changes — package, tests, and CLI surface are identical to v0.6.0.
+
 ## [0.6.0] — 2026-05-02 — Hardening, 9th strategy, embedding providers, public leaderboard
 
 ### Added
