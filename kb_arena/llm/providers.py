@@ -150,6 +150,70 @@ class OpenAIProvider(LLMProvider):
         )
 
 
+class AzureOpenAIProvider(LLMProvider):
+    """Azure OpenAI backend — uses deployment names instead of model names."""
+
+    def __init__(
+        self,
+        api_key: str,
+        azure_endpoint: str,
+        api_version: str = "2025-01-01-preview",
+    ):
+        import openai
+
+        self.client = openai.AsyncAzureOpenAI(
+            api_key=api_key,
+            azure_endpoint=azure_endpoint,
+            api_version=api_version,
+        )
+
+    async def complete(self, model, system, user, max_tokens=4096, temperature=0):
+        # For Azure OpenAI, `model` is the deployment name.
+        response = await self.client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        choice = response.choices[0]
+        usage = response.usage
+        return ProviderResponse(
+            text=choice.message.content or "",
+            input_tokens=usage.prompt_tokens if usage else 0,
+            output_tokens=usage.completion_tokens if usage else 0,
+            model=model,
+        )
+
+    async def stream_text(self, model, system, user, max_tokens=4096, temperature=0):
+        stream = await self.client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        last_usage = None
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+            if chunk.usage:
+                last_usage = chunk.usage
+
+        self.last_stream_response = ProviderResponse(
+            text="",
+            input_tokens=last_usage.prompt_tokens if last_usage else 0,
+            output_tokens=last_usage.completion_tokens if last_usage else 0,
+            model=model,
+        )
+
+
 class OllamaProvider(LLMProvider):
     """Ollama local inference backend."""
 
@@ -218,9 +282,15 @@ def create_provider(provider_name: str, **kwargs) -> LLMProvider:
         return AnthropicProvider(api_key=kwargs.get("api_key", ""))
     elif provider_name == "openai":
         return OpenAIProvider(api_key=kwargs.get("api_key", ""))
+    elif provider_name == "azure_openai":
+        return AzureOpenAIProvider(
+            api_key=kwargs.get("api_key", ""),
+            azure_endpoint=kwargs.get("azure_endpoint", ""),
+            api_version=kwargs.get("api_version", "2025-01-01-preview"),
+        )
     elif provider_name == "ollama":
         return OllamaProvider(base_url=kwargs.get("base_url", "http://localhost:11434"))
     else:
         raise ValueError(
-            f"Unknown LLM provider: {provider_name}. Choose: anthropic, openai, ollama"
+            f"Unknown LLM provider: {provider_name}. Choose: anthropic, openai, azure_openai, ollama"
         )

@@ -109,6 +109,28 @@ class LLMClient:
                 "fast": settings.openai_fast_model,
                 "judge": settings.openai_judge_model,
             }
+        elif provider_name == "azure_openai":
+            key = api_key or settings.llm_api_key or settings.azure_openai_api_key
+            self._provider = create_provider(
+                "azure_openai",
+                api_key=key,
+                azure_endpoint=settings.azure_openai_endpoint,
+                api_version=settings.azure_openai_api_version,
+            )
+            default_dep = settings.azure_openai_deployment_name
+            self._models = {
+                "generate": settings.azure_openai_generate_deployment or default_dep,
+                "fast": settings.azure_openai_fast_deployment or default_dep,
+                "judge": settings.azure_openai_judge_deployment or default_dep,
+            }
+            # Register the configured model name for pricing lookup
+            _model_alias = settings.azure_openai_model_name
+            if _model_alias and _model_alias not in _MODEL_PRICING:
+                # Map the Azure model name to an existing pricing tier via substring match
+                for tier in _MODEL_PRICING:
+                    if tier in _model_alias:
+                        _MODEL_PRICING[_model_alias] = _MODEL_PRICING[tier]
+                        break
         elif provider_name == "ollama":
             self._provider = create_provider("ollama", base_url=settings.ollama_base_url)
             self._models = {
@@ -117,7 +139,7 @@ class LLMClient:
                 "judge": settings.ollama_judge_model,
             }
         else:
-            raise ValueError(f"Unknown provider: {provider_name}")
+            raise ValueError(f"Unknown provider: {provider_name}. Choose: anthropic, openai, azure_openai, ollama")
 
         self._last_stream_usage: LLMResponse | None = None
 

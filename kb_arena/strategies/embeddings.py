@@ -77,6 +77,68 @@ class OpenAIEmbedding(EmbeddingFunction[Documents]):
         return _retry(_call)
 
 
+class AzureOpenAIEmbedding(EmbeddingFunction[Documents]):
+    """Azure OpenAI embeddings via the openai SDK AzureOpenAI client.
+
+    Reads from settings (or accepts explicit constructor args):
+      - api_key           → AZURE_OPENAI_EMBEDDING_API_KEY (falls back to AZURE_OPENAI_API_KEY)
+      - azure_endpoint    → AZURE_OPENAI_EMBEDDING_ENDPOINT (falls back to AZURE_OPENAI_ENDPOINT)
+      - deployment_name   → AZURE_OPENAI_EMBEDDING_DEPLOYMENT
+      - api_version       → AZURE_OPENAI_EMBEDDING_API_VERSION (falls back to AZURE_OPENAI_API_VERSION)
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        azure_endpoint: str | None = None,
+        deployment_name: str | None = None,
+        api_version: str | None = None,
+    ) -> None:
+        import openai
+
+        resolved_key = (
+            api_key
+            or settings.azure_openai_embedding_api_key
+            or settings.azure_openai_api_key
+        )
+        resolved_endpoint = (
+            azure_endpoint
+            or settings.azure_openai_embedding_endpoint
+            or settings.azure_openai_endpoint
+        )
+        resolved_version = (
+            api_version
+            or settings.azure_openai_embedding_api_version
+            or settings.azure_openai_api_version
+        )
+        self._deployment = deployment_name or settings.azure_openai_embedding_deployment
+        if not self._deployment:
+            raise ValueError(
+                "Azure OpenAI embedding deployment name is required. "
+                "Set AZURE_OPENAI_EMBEDDING_DEPLOYMENT in your .env file."
+            )
+        if not resolved_endpoint:
+            raise ValueError(
+                "Azure OpenAI endpoint is required. "
+                "Set AZURE_OPENAI_EMBEDDING_ENDPOINT (or AZURE_OPENAI_ENDPOINT) in your .env file."
+            )
+        self._client = openai.AzureOpenAI(
+            api_key=resolved_key,
+            azure_endpoint=resolved_endpoint,
+            api_version=resolved_version or "2025-01-01-preview",
+            timeout=_TIMEOUT_S,
+        )
+
+    def __call__(self, input: Documents) -> Embeddings:  # type: ignore[override]
+        def _call():
+            resp = self._client.embeddings.create(
+                model=self._deployment, input=list(input)
+            )
+            return [e.embedding for e in sorted(resp.data, key=lambda x: x.index)]
+
+        return _retry(_call)
+
+
 class VoyageEmbedding(EmbeddingFunction[Documents]):
     """Voyage AI embeddings — voyage-3-large is current MTEB retrieval leader."""
 
@@ -191,6 +253,7 @@ class GeminiEmbedding(EmbeddingFunction[Documents]):
 
 _PROVIDERS: dict[str, type[EmbeddingFunction[Documents]]] = {
     "openai": OpenAIEmbedding,
+    "azure_openai": AzureOpenAIEmbedding,
     "voyage": VoyageEmbedding,
     "cohere": CohereEmbedding,
     "bge": BGEEmbedding,
@@ -204,11 +267,14 @@ def get_embedding_function(**kwargs: Any) -> EmbeddingFunction[Documents]:
 
     Defaults to OpenAI for backward compatibility. Pass per-provider kwargs
     through (e.g. `model="bge-base-en-v1.5"`).
+
+    Supported providers: openai, azure_openai, voyage, cohere, bge, ollama, gemini.
     """
     provider = (settings.embedding_provider or "openai").lower()
     cls = _PROVIDERS.get(provider)
     if cls is None:
         raise ValueError(
-            f"Unknown KB_ARENA_EMBEDDING_PROVIDER={provider!r}. " f"Valid: {sorted(_PROVIDERS)}"
+            f"Unknown KB_ARENA_EMBEDDING_PROVIDER={provider!r}. "
+            f"Valid: {sorted(_PROVIDERS)}"
         )
     return cls(**kwargs)

@@ -1,10 +1,16 @@
 """Application settings via pydantic-settings. All config from environment."""
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    model_config = {"env_prefix": "KB_ARENA_", "env_file": ".env", "extra": "ignore"}
+    model_config = {
+        "env_prefix": "KB_ARENA_",
+        "env_file": ".env",
+        "extra": "ignore",
+        "populate_by_name": True,
+    }
 
     # LLM — Anthropic (latest models)
     anthropic_api_key: str = ""
@@ -14,7 +20,7 @@ class Settings(BaseSettings):
     judge_model: str = "claude-opus-4-6"
 
     # LLM provider selection
-    llm_provider: str = "anthropic"  # anthropic | openai | ollama
+    llm_provider: str = "anthropic"  # anthropic | openai | azure_openai | ollama
     llm_api_key: str = ""  # generic key, falls back to provider-specific
 
     # Ollama settings
@@ -32,6 +38,86 @@ class Settings(BaseSettings):
 
     # LLM — OpenAI (for embeddings)
     openai_api_key: str = ""
+
+    # ── Azure OpenAI ─────────────────────────────────────────────────────────
+    # Accepts bare AZURE_OPENAI_* names (as typically set by Azure tooling) as
+    # well as the KB_ARENA_AZURE_OPENAI_* prefixed variants.
+
+    # LLM / Chat
+    azure_openai_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("AZURE_OPENAI_API_KEY", "KB_ARENA_AZURE_OPENAI_API_KEY"),
+    )
+    azure_openai_endpoint: str = Field(
+        default="",
+        validation_alias=AliasChoices("AZURE_OPENAI_ENDPOINT", "KB_ARENA_AZURE_OPENAI_ENDPOINT"),
+    )
+    azure_openai_api_version: str = Field(
+        default="2025-01-01-preview",
+        validation_alias=AliasChoices(
+            "AZURE_OPENAI_API_VERSION", "KB_ARENA_AZURE_OPENAI_API_VERSION"
+        ),
+    )
+    # Primary deployment name — used for generate, fast, and judge unless overridden below.
+    azure_openai_deployment_name: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "AZURE_OPENAI_DEPLOYMENT_NAME", "KB_ARENA_AZURE_OPENAI_DEPLOYMENT_NAME"
+        ),
+    )
+    # Optional: override per-role deployment (falls back to azure_openai_deployment_name)
+    azure_openai_generate_deployment: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "AZURE_OPENAI_GENERATE_DEPLOYMENT", "KB_ARENA_AZURE_OPENAI_GENERATE_DEPLOYMENT"
+        ),
+    )
+    azure_openai_fast_deployment: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "AZURE_OPENAI_FAST_DEPLOYMENT", "KB_ARENA_AZURE_OPENAI_FAST_DEPLOYMENT"
+        ),
+    )
+    azure_openai_judge_deployment: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "AZURE_OPENAI_JUDGE_DEPLOYMENT", "KB_ARENA_AZURE_OPENAI_JUDGE_DEPLOYMENT"
+        ),
+    )
+    # Informational model name used for cost estimation (e.g. "gpt-4o", "gpt-4.1").
+    azure_openai_model_name: str = Field(
+        default="gpt-4o",
+        validation_alias=AliasChoices(
+            "AZURE_OPENAI_MODEL_NAME", "KB_ARENA_AZURE_OPENAI_MODEL_NAME"
+        ),
+    )
+
+    # Embeddings
+    azure_openai_embedding_deployment: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "KB_ARENA_AZURE_OPENAI_EMBEDDING_DEPLOYMENT"
+        ),
+    )
+    azure_openai_embedding_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "AZURE_OPENAI_EMBEDDING_API_KEY", "KB_ARENA_AZURE_OPENAI_EMBEDDING_API_KEY"
+        ),
+    )
+    azure_openai_embedding_endpoint: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "AZURE_OPENAI_EMBEDDING_ENDPOINT", "KB_ARENA_AZURE_OPENAI_EMBEDDING_ENDPOINT"
+        ),
+    )
+    azure_openai_embedding_api_version: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "AZURE_OPENAI_EMBEDDING_API_VERSION",
+            "KB_ARENA_AZURE_OPENAI_EMBEDDING_API_VERSION",
+        ),
+    )
 
     # Neo4j
     neo4j_uri: str = "bolt://localhost:7687"
